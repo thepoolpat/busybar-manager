@@ -2,6 +2,7 @@
 """Poolpat stats: live streaming numbers scrolling right to left across the bar.
 
     python3 app.py                        # BUSY Bar over USB (always 10.0.4.20)
+    python3 app.py --render host          # per-service pills and logos instead
     python3 app.py --source songstats     # live daily numbers, needs SONGSTATS_API_KEY
     python3 app.py --speed 6              # slower crawl, pixels per second
     python3 app.py --sc 28588 --sp 20936 --am 4174   # pin the numbers, skip fetching
@@ -51,6 +52,7 @@ import base64
 import colorsys
 import fcntl
 import json
+import math
 import os
 import signal
 import struct
@@ -91,8 +93,14 @@ PILL_R = PILL_H // 2          # radius half the height is what makes it a pill
 # a coloured pill, which is why this app uses extra_large despite costing a
 # pixel of advance per digit.
 FONT = "extra_large"
-ADVANCE = 8                              # every digit except "1"
-ADVANCES = {"1": 5, ",": 3}
+ADVANCE = 8                              # the common width: every digit but "1"
+# extra_large is proportional, and these are the atlas's own advances for every
+# character this app can put on the bar. Grouped by width rather than listed per
+# character because that is how the font is actually built, and because a table
+# of forty near-identical lines is a table nobody re-checks.
+ADVANCES = {}
+for _w, _chars in ((3, ",."), (4, " "), (5, "I1"), (7, "EFJLTZ"), (9, "MVW")):
+    ADVANCES.update(dict.fromkeys(_chars, _w))
 DIGIT_H = 10                             # extra_large cap height, from the atlas
 
 
@@ -408,8 +416,11 @@ HANDOVER_MAX = 1.0
 RAINBOW_V = 0.9                  # not 1.0: white digits need somewhere to sit
 
 
-def mix(a, b, t):
+def mix(a, b, t, v=1.0):
     """Blend two #RRGGBBAA colours along the hue wheel, t=0 all a, t=1 all b.
+
+    `v` scales the result's brightness, which is how the luminance wave rides
+    on top of the hue without disturbing it.
 
     ponytail: NOT a straight RGB lerp. Orange to green in RGB passes through
     olive -- it looked like mud on the device, which is what sent me here.
@@ -430,7 +441,7 @@ def mix(a, b, t):
         dh += 1.0
     r, g, bl = colorsys.hsv_to_rgb((h1 + dh * t) % 1.0,
                                    s1 + (s2 - s1) * t,
-                                   (v1 + (v2 - v1) * t) * RAINBOW_V)
+                                   (v1 + (v2 - v1) * t) * RAINBOW_V * v)
     return "#%02X%02X%02XFF" % (round(r * 255), round(g * 255), round(bl * 255))
 
 
@@ -758,6 +769,232 @@ def prepare(host, source, stats):
             delay = min(delay * 2, 30)
 
 
+# --- device render ------------------------------------------------------------
+#
+# The tfi-202 pattern, and the only way to get panel-rate motion out of this
+# bar: hand the firmware ONE text element with a scroll_rate and let it do the
+# scrolling itself. There is no frame loop here, so there is no draw rate to
+# jitter -- the panel renders at its own 60 Hz and the host does almost nothing.
+#
+# What it costs is the per-service pills and logos, because scroll_rate moves
+# text and nothing else (the schema puts those fields on TextElement alone).
+# So the services are named in words instead of drawn as marks, and the brand
+# colour moves to the pill underneath.
+#
+# The pill still flows through the service colours, because a rectangle can be
+# redrawn by id WITHOUT disturbing a text element that is mid-scroll -- verified
+# on the device: five pill recolours during a scroll left the text advancing.
+# That is one element a few times a second, against fifteen at twelve frames a
+# second for the host-rendered banner.
+LABELS = {"globe": "TOTAL", "soundcloud": "SOUNDCLOUD", "spotify": "SPOTIFY",
+          "apple_music": "APPLE MUSIC", "fans": "FANS"}
+SEPARATOR = "   "                        # blank run between one service and the next
+SCROLL_PPM = 3600                        # pixels per MINUTE: 60 px/s
+SCROLL_START_MS = 600
+SCROLL_REPEAT_MS = 1500
+TEXT_X, TEXT_W = 4, 64                   # the label window, inset inside the pill
+# Pill recolours per second. The firmware scrolls the text at panel rate on its
+# own; this is only how often the colour under it is refreshed, and at 60 px/s a
+# 60 Hz recolour moves the gradient exactly one pixel per update -- in step with
+# the words rather than catching up in visible jumps.
+#
+# MEASURED: a pill-only draw runs at 70.1/s over USB, against 12.8/s for the
+# fifteen-element host-rendered banner. One element is what makes 60 reachable
+# here when it is not there at all. The loop still measures and holds a cadence,
+# so a slower cable simply settles lower instead of falling behind.
+RECOLOUR_HZ = 60
+
+
+def strip(counts):
+    """The whole banner as one line of text, plus where each service starts.
+
+    The offsets are what let the pill know which service is under the window at
+    any moment, so the colour can follow the words rather than run on a clock of
+    its own.
+    """
+    parts, marks, x = [], [], 0
+    for key, value in counts:
+        text = f"{LABELS[key]} {value:,}"
+        marks.append((x, key))
+        parts.append(text)
+        x += text_width(text) + text_width(SEPARATOR)
+    return SEPARATOR.join(parts), marks, x
+
+
+# How far either side of a service boundary the colours blend. Wider than the
+# gap between two services would smear every colour into its neighbours; much
+# narrower and the pill changes colour in a visible step as a word crosses the
+# window edge.
+BLEND_PX = 34
+
+# Brightness is the third thing that travels, after position and hue. A pill
+# whose colour changes but whose luminance never does reads flat, because the
+# eye tracks brightness far more readily than hue -- so a slow value wave along
+# the scroll is what makes the gradient look like it is moving rather than just
+# being recoloured. Kept as a floor and a ceiling rather than one "amount" so
+# both ends are directly tunable: --dim sets how dark the trough goes, --bright
+# how bright the crest, and equal values switch the wave off entirely.
+DIM_FLOOR = 0.62
+DIM_CEILING = 1.0
+PULSE_PX = 96                 # target length of one dark-to-bright-to-dark wave
+
+
+def pulse_period(total):
+    """The wave length actually used: PULSE_PX rounded so it divides the strip.
+
+    ponytail: a wave whose period does not divide the strip does not close, and
+    the brightness then jumps at the moment the scroll wraps -- a visible blink
+    once per pass. Fitting a whole number of cycles costs one division and
+    removes the seam entirely.
+    """
+    return total / max(1, round(total / PULSE_PX))
+
+
+def brightness_at(px, total, floor=DIM_FLOOR, ceiling=DIM_CEILING):
+    """Value multiplier at one scroll position: a smooth wave, never a step.
+
+    A cosine rather than a triangle, because a triangle's turning points are
+    visible as a flick at the top and bottom of the wave.
+    """
+    period = pulse_period(total)
+    wave = (1.0 - math.cos(2.0 * math.pi * (px % period) / period)) / 2.0
+    return floor + (ceiling - floor) * wave
+
+
+def color_at(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
+    """The banner's colour at one scroll position, as a continuous function.
+
+    This is what makes the gradient scroll rather than merely change: sampling
+    it at the window's two edges gives a pair of stops that slide through the
+    pill in step with the words underneath, so Spotify green is still leaving
+    the left of the pill while Apple red is already arriving at the right.
+
+    Pure brand colour through the middle of a service, blending across
+    BLEND_PX either side of each boundary and passing exactly half way at the
+    boundary itself, so no service ever hands over abruptly.
+    """
+    v = brightness_at(px, total, floor, ceiling)
+    here = px % total
+    i = len(marks) - 1
+    for j in range(len(marks) - 1, -1, -1):
+        if here >= marks[j][0]:
+            i = j
+            break
+    key = marks[i][1]
+    start = marks[i][0]
+    end = marks[i + 1][0] if i + 1 < len(marks) else total
+    if here - start < BLEND_PX:                  # arriving from the previous one
+        prev = marks[i - 1][1]
+        return mix(pill_color(prev), pill_color(key),
+                   0.5 + 0.5 * (here - start) / BLEND_PX, v)
+    if end - here < BLEND_PX:                    # handing over to the next one
+        nxt = marks[(i + 1) % len(marks)][1]
+        return mix(pill_color(key), pill_color(nxt),
+                   0.5 * (BLEND_PX - (end - here)) / BLEND_PX, v)
+    return mix(pill_color(key), pill_color(key), 0.0, v)
+
+
+def window_colors(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
+    """The two gradient stops for a window whose left edge is at px.
+
+    ponytail: the firmware never reports its scroll position, so px is
+    recomputed from scroll_rate and the clock. That is an open loop and can
+    drift out of step with the panel over a long run, which would show as the
+    colour leading or trailing the words. There is nothing to poll, so the fix
+    if it ever shows is a shorter strip, not a faster tick.
+    """
+    return [color_at(marks, total, px, floor, ceiling),
+            color_at(marks, total, px + TEXT_W, floor, ceiling)]
+
+
+def device_frame(text, colors):
+    return [
+        {"id": "pill", "type": "rectangle", "x": 0, "y": 0,
+         "width": W, "height": PILL_H, "radius": PILL_R,
+         "fill": "gradient_h", "fill_colors": colors, "border_width": 0,
+         "align": "top_left", "z_index": 0, "timeout": ELEMENT_TIMEOUT},
+        {"id": "txt", "type": "text", "text": text, "font": FONT, "color": NUMBER,
+         "x": TEXT_X, "y": H // 2, "align": "mid_left", "width": TEXT_W,
+         "scroll_rate": SCROLL_PPM, "scroll_start_delay": SCROLL_START_MS,
+         "scroll_repeat_delay": SCROLL_REPEAT_MS,
+         "z_index": 5, "timeout": ELEMENT_TIMEOUT},
+    ]
+
+
+def device_pill(colors):
+    """Just the pill, by id -- leaves a mid-scroll text element alone."""
+    return [device_frame("", colors)[0]]
+
+
+def run_device(args, stats):
+    """Scroll on the firmware, recolour from the host. No frame loop."""
+    text, marks, total = strip(counts_from(stats))
+    print(f"{len(text)} chars / {total}px on the firmware at "
+          f"{SCROLL_PPM / 60:.0f} px/s - the panel renders it, not this process")
+
+    started = time.monotonic()
+    if not 0.0 <= args.dim <= args.bright <= 1.0:
+        raise SystemExit("--dim must be between 0 and --bright, and --bright at most 1")
+    print(f"brightness wave {args.dim:.2f}-{args.bright:.2f} every {PULSE_PX}px")
+    draw(args.host, device_frame(
+        text, window_colors(marks, total, 0.0, args.dim, args.bright)))
+    next_fetch = started + args.refresh
+    blocked = False
+    ticks, reported, beat, due = 0, started, 1.0 / RECOLOUR_HZ, started
+    try:
+        while True:
+            now = time.monotonic()
+            # Where the firmware has scrolled to by now, from its own rate.
+            px = (now - started - SCROLL_START_MS / 1000.0) * (SCROLL_PPM / 60.0)
+            px = max(0.0, px)
+            colors = window_colors(marks, total, px, args.dim, args.bright)
+            try:
+                status, body = draw(args.host, device_pill(colors))
+            except urllib.error.URLError as e:
+                print(f"skipped a recolour ({e.reason})")
+            else:
+                if status >= 300:
+                    if not blocked:
+                        print(f"{status} {body.strip()} - holding until the screen frees up")
+                        blocked = True
+                elif blocked:
+                    print("screen free again")
+                    blocked = False
+
+            if stats["as_of"] != "pinned" and now >= next_fetch:
+                next_fetch = now + args.refresh
+                try:
+                    fresh = fetch_stats(args.source)
+                except Exception as e:                  # noqa: BLE001
+                    print(f"refresh failed, keeping the last numbers ({e})")
+                else:
+                    if counts_from(fresh) != counts_from(stats):
+                        stats = fresh
+                        text, marks, total = strip(counts_from(stats))
+                        started = due = time.monotonic()   # the strip changed length
+                        draw(args.host, device_frame(text, colors))
+                        print(f"updated: {total}px")
+            ticks += 1
+            if ticks == CADENCE_SAMPLE and beat == 1.0 / RECOLOUR_HZ:
+                rate = CADENCE_SAMPLE / (time.monotonic() - started)
+                if rate < RECOLOUR_HZ:
+                    beat = 1.0 / max(1.0, rate * CADENCE_HEADROOM)
+                if args.profile:
+                    print(f"measured {rate:.1f} recolours/s; holding {1 / beat:.1f} Hz")
+            if args.profile and now - reported >= 5.0:
+                print(f"{ticks / (now - reported):.1f} Hz recolour, "
+                      f"firmware scrolling at {SCROLL_PPM / 60:.0f} px/s")
+                ticks, reported = 0, now
+            due += beat
+            time.sleep(max(0.0, due - time.monotonic()))
+            if due < time.monotonic() - 1.0:
+                due = time.monotonic()
+    except KeyboardInterrupt:
+        clear(args.host)
+        print("\ncleared")
+        return 0
+
+
 def run(args):
     lock = claim()
     if lock is None:
@@ -778,6 +1015,9 @@ def run(args):
     print(f"{stats['as_of'] if stats['as_of'] == 'pinned' else args.source} "
           f"stats as of {stats['as_of']}: "
           f"sc={stats['sc']} sp={stats['sp']} am={stats['am']}")
+
+    if args.render == "device":
+        return run_device(args, stats)
 
     if args.speed < 1:
         # ponytail: a scroller that does not scroll is a divide by zero two
@@ -970,7 +1210,78 @@ def self_check():
     except MisconfiguredError as e:
         assert "security add-generic-password" in str(e), "must say how to fix it"
 
+    # the firmware-scrolled strip: every service named, and the colour able to
+    # say which one is under the window
+    text, marks, total = strip(counts_from(social))
+    assert text.startswith("TOTAL 53,698"), text[:20]
+    assert "SOUNDCLOUD 28,588" in text and "FANS 1,726" in text, text
+    assert [k for _, k in marks] == ["globe", "soundcloud", "spotify",
+                                     "apple_music", "fans"], marks
+    assert total == sum(text_width(f"{LABELS[k]} {v:,}") + text_width(SEPARATOR)
+                        for k, v in counts_from(social)), total
+    # the middle of a service is its own pure brand colour
+    for at, key in marks:
+        mid = at + BLEND_PX + 1
+        end = total if key == marks[-1][1] else marks[[k for _, k in marks].index(key) + 1][0]
+        if end - mid > BLEND_PX:
+            # pure brand hue through the middle -- the brightness wave rides on
+            # top of it, so compare against the same colour at the same value
+            assert color_at(marks, total, mid) == mix(
+                pill_color(key), pill_color(key), 0.0, brightness_at(mid, total)), key
+
+    # the brightness wave: smooth, bounded, and a full cycle every PULSE_PX
+    per = pulse_period(total)
+    assert brightness_at(0, total) == DIM_FLOOR, brightness_at(0, total)
+    assert abs(brightness_at(per / 2, total) - DIM_CEILING) < 1e-9
+    # a whole number of waves must fit the strip, or the brightness blinks on wrap
+    assert abs(total / per - round(total / per)) < 1e-9, (total, per)
+    assert abs(brightness_at(float(total), total) - brightness_at(0, total)) < 1e-9
+    assert all(DIM_FLOOR - 1e-9 <= brightness_at(x, total) <= DIM_CEILING + 1e-9
+               for x in range(0, total))
+    # no flick at the turning points: the step between samples shrinks near them
+    near_crest = abs(brightness_at(per / 2, total) - brightness_at(per / 2 - 1, total))
+    mid_slope = abs(brightness_at(per / 4, total) - brightness_at(per / 4 - 1, total))
+    assert near_crest < mid_slope, "a cosine flattens at the crest; a triangle does not"
+    # equal floor and ceiling switches the wave off, which is what --dim==--bright is for
+    assert len({round(brightness_at(x, total, 0.8, 0.8), 6) for x in range(50)}) == 1
+    # at 60 px/s a 60 Hz recolour moves the gradient one pixel per update
+    assert abs(SCROLL_PPM / 60.0 / RECOLOUR_HZ - 1.0) < 1e-9, "colour must keep step"
+
+    # the gradient must SCROLL: the two stops differ wherever a boundary is
+    # inside the window, and both stops move as the scroll advances
+    a = window_colors(marks, total, 0.0)
+    b = window_colors(marks, total, 25.0)
+    assert a != b, "the gradient must move with the scroll, not sit still"
+    assert len(a) == 2, a
+    # and it is continuous: a small step in position never jumps the colour far
+    def far(p, q):
+        return max(abs(int(p[i:i + 2], 16) - int(q[i:i + 2], 16)) for i in (1, 3, 5))
+    prev = color_at(marks, total, 0.0)
+    worst = 0
+    for px in range(1, total):
+        cur = color_at(marks, total, float(px))
+        worst = max(worst, far(prev, cur))
+        prev = cur
+    assert worst <= 40, f"colour jumps {worst} in one pixel - that is a step, not a blend"
+    # the loop closes: the colour at the very end matches the colour at the start
+    assert far(color_at(marks, total, 0.0), color_at(marks, total, float(total))) == 0
+
+    # the firmware does the scrolling: the text element carries a rate, the
+    # recolour carries only the pill so a mid-scroll label is never disturbed
+    els = device_frame(text, ["#5B4FE9FF", "#FF5500FF"])
+    assert len(els) == 2 and els[1]["scroll_rate"] == SCROLL_PPM
+    assert els[1]["width"] == TEXT_W and els[1]["x"] == TEXT_X
+    assert TEXT_X + TEXT_W <= W, "the label window must fit inside the display"
+    assert [e["id"] for e in device_pill(["#000000FF", "#000000FF"])] == ["pill"], \
+        "a recolour must send the pill alone, or the scroll restarts"
+    # a recolour is one element where a host frame is fifteen, which is the whole
+    # reason 60 is reachable here and 13 was the ceiling there
+    host_frame = frame(layout(counts_from(social))[0], 0, 0.0)
+    assert len(device_pill(["#000000FF", "#000000FF"])) * 5 < len(host_frame), \
+        "a recolour must stay far cheaper than a host frame"
+
     args = parse_args([])
+    assert args.render == "device", "the firmware renders by default"
     assert pinned(args) is None, "no overrides means fetch"
     assert pinned(parse_args(["--sc", "1", "--sp", "2", "--am", "3"]))["sc"] == 1
     # the songstats shape must be rehearsable: no --am, so no Apple Music tile
@@ -1006,6 +1317,15 @@ def parse_args(argv=None):
     p.add_argument("--am", type=int, default=None, help="pin Apple Music plays, skip fetching")
     p.add_argument("--fans", type=int, default=None,
                    help="pin the all-platform follower total")
+    p.add_argument("--dim", type=float, default=DIM_FLOOR,
+                   help="brightness at the trough of the wave, 0-1 "
+                        "(set equal to --bright for no wave)")
+    p.add_argument("--bright", type=float, default=DIM_CEILING,
+                   help="brightness at the crest of the wave, 0-1")
+    p.add_argument("--render", choices=("device", "host"), default="device",
+                   help="device: the firmware scrolls (smooth, no logos). "
+                        "host: this process pushes frames (logos and per-service "
+                        "pills, capped near 12 fps)")
     p.add_argument("--profile", action="store_true",
                    help="print the achieved draw rate every 5s")
     p.add_argument("--speed", type=int, default=12,
