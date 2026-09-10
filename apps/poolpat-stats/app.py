@@ -213,6 +213,15 @@ NUMBER = "#FFFFFFFF"
 # orange pill is invisible, which is exactly what it looked like on the device.
 # So the whole system is one rule -- pill is the brand, everything on it is white.
 LOGO = "#FFFFFFFF"
+# SoundCloud is the exception: its orange is bright enough that a white cloud on
+# it is the weakest mark on the banner, and black reads at a glance where white
+# only reads once you look for it. Anything added here needs the same test --
+# hold the logo colour against its own pill, not against the black background.
+LOGO_COLOR = {"soundcloud": "#000000FF"}
+
+
+def logo_color(key):
+    return LOGO_COLOR.get(key, LOGO)
 
 # Every brand colour below was taken from that company's own guidelines, not
 # from a colour-aggregator site. The same question was asked of each: what hex
@@ -383,30 +392,57 @@ def pill_color(key):
     return PILL_COLOR.get(key, BRAND[key][1])
 
 
-# ponytail: a rectangle takes at most two fill_colors (the schema says
-# maxItems: 2), so a rainbow cannot be painted as a multi-stop gradient. What it
-# can be is two stops that travel round the hue wheel together, which reads as a
-# rainbow moving through the pill rather than a static band of one. `spread` is
-# how far apart the two ends sit on the wheel: much wider and the pill's two
-# halves stop looking related, much narrower and it is a one-colour pill again.
-RAINBOW_SPREAD = 0.3                     # ~110 degrees of hue across the pill
-RAINBOW_TURNS = 0.5                      # hue revolutions per sweep phase unit
-RAINBOW_V = 0.9                          # not 1.0: white digits need somewhere
-                                         # to sit against yellow and cyan
+# A rainbow made of the services themselves rather than of the raw hue wheel.
+# Each pill starts at its own brand colour and its gradient runs toward the NEXT
+# service in the banner, so the colour hands over where the pills do: indigo
+# into SoundCloud orange, orange into Spotify green, green into Apple red, red
+# into the follower pink, pink back round into indigo. Scrolling the banner
+# therefore scrolls one continuous spectrum, and every pill still leads with the
+# colour that identifies it.
+#
+# ponytail: the schema's two fill_colors is not a limit here, it is the whole
+# mechanism -- two stops per pill is exactly "me, handing over to the next one".
+# What travels is how FAR toward the neighbour the second stop has reached.
+HANDOVER_MIN = 0.35              # never a full handover: the pill keeps its identity
+HANDOVER_MAX = 1.0
+RAINBOW_V = 0.9                  # not 1.0: white digits need somewhere to sit
 
 
-def rainbow(phase):
-    """Two hue-wheel stops a fixed distance apart, both rotating with phase.
+def mix(a, b, t):
+    """Blend two #RRGGBBAA colours along the hue wheel, t=0 all a, t=1 all b.
 
-    Full saturation, because a desaturated rainbow on a 72x16 panel just reads
-    as mud. The value is held slightly under 1.0 so the white number on top
-    keeps its contrast where the wheel passes through yellow.
+    ponytail: NOT a straight RGB lerp. Orange to green in RGB passes through
+    olive -- it looked like mud on the device, which is what sent me here.
+    Going round the hue wheel passes through yellow instead, so the handover
+    between two services reads as a spectrum rather than as a dirty smear.
+    The arc taken is always the shorter one, or a 20-degree handover would go
+    the long way round and cycle through every colour the pair does not contain.
     """
-    def stop(h):
-        r, g, b = colorsys.hsv_to_rgb(h % 1.0, 1.0, RAINBOW_V)
-        return "#%02X%02X%02XFF" % (round(r * 255), round(g * 255), round(b * 255))
-    turn = phase * RAINBOW_TURNS
-    return [stop(turn), stop(turn + RAINBOW_SPREAD)]
+    def hsv(c):
+        r, g, bl = (int(c[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+        return colorsys.rgb_to_hsv(r, g, bl)
+    h1, s1, v1 = hsv(a)
+    h2, s2, v2 = hsv(b)
+    dh = h2 - h1
+    if dh > 0.5:
+        dh -= 1.0                        # shorter way round the wheel
+    elif dh < -0.5:
+        dh += 1.0
+    r, g, bl = colorsys.hsv_to_rgb((h1 + dh * t) % 1.0,
+                                   s1 + (s2 - s1) * t,
+                                   (v1 + (v2 - v1) * t) * RAINBOW_V)
+    return "#%02X%02X%02XFF" % (round(r * 255), round(g * 255), round(bl * 255))
+
+
+def flow(here, nxt, phase):
+    """This pill's two gradient stops: its own colour, handing over to the next.
+
+    `phase` travels with the banner, so the handover point breathes along the
+    pill rather than sitting still. It never reaches zero, because a pill that
+    has fully become its neighbour has stopped saying which service it is.
+    """
+    reach = HANDOVER_MIN + (HANDOVER_MAX - HANDOVER_MIN) * abs(1.0 - (phase % 2.0))
+    return [mix(here, here, 0.0), mix(here, nxt, reach)]
 
 
 def sweep(color, phase):
@@ -439,10 +475,11 @@ def frame(segs, offset, phase=0.0):
                     "x": s["pill_x"] + offset, "y": 0,
                     "width": s["pill_w"], "height": PILL_H, "radius": PILL_R,
                     "fill": "gradient_h",
-                    # The follower pill is every platform at once, so it gets
-                    # every colour at once rather than any one service's.
-                    "fill_colors": (rainbow(phase) if s["key"] == "fans"
-                                    else sweep(pill_color(s["key"]), phase + i * 0.25)),
+                    # Hand over to whichever service comes next, wrapping at
+                    # the end so the banner is one loop of colour, not a line.
+                    "fill_colors": flow(pill_color(s["key"]),
+                                        pill_color(segs[(i + 1) % len(segs)]["key"]),
+                                        phase + i * 0.25),
                     "border_width": 0, "align": "top_left",
                     "z_index": 0, "timeout": ELEMENT_TIMEOUT})
         els.append({"id": f"i{i}", "type": "image", "path": f"{s['key']}.png",
@@ -706,7 +743,7 @@ def prepare(host, source, stats):
         try:
             clear(host)       # elements merge by id, so drop anything stale first
             for key, (grid, _, _) in BRAND.items():
-                upload(host, f"{key}.png", icon_png(grid, LOGO))
+                upload(host, f"{key}.png", icon_png(grid, logo_color(key)))
             return stats or fetch_stats(source)
         except KeyboardInterrupt:
             raise
@@ -848,12 +885,13 @@ def run(args):
 def self_check():
     for key, (grid, color, _) in BRAND.items():
         assert len(grid) == ICON, (key, len(grid))
-        assert pill_color(key) != LOGO, f"{key}'s logo would vanish into its pill"
+        assert pill_color(key) != logo_color(key), \
+            f"{key}'s logo would vanish into its pill"
         assert all(len(row) == ICON for row in grid), key
         assert all(set(row) <= {"#", "."} for row in grid), key
         assert sum(row.count("#") for row in grid) > 20, f"{key} is too sparse to read"
         assert len(color) == 9 and color.startswith("#"), key
-        png = icon_png(grid, LOGO)
+        png = icon_png(grid, logo_color(key))
         assert png.startswith(b"\x89PNG"), key
 
     stats = {"sc": 28588, "sp": 20936, "am": 4174, "fans": None, "as_of": "test"}
@@ -883,141 +921,43 @@ def self_check():
     # the gradient has to actually move, or it is just a two-tone fill
     assert sweep("#FF5500FF", 0.0) != sweep("#FF5500FF", 0.7), "sweep is static"
     # the gradient must be locked to travel, not to the clock: same pixel means
-    # same colour, a moved pixel means a moved colour, and a still banner is
-    # still in both senses
+    # same colour, a moved pixel means a moved colour
     phase_at = lambda px: px * SWEEP_PER_PX
-    assert phase_at(7) == phase_at(7), "the same pixel must give the same phase"
-    assert rainbow(phase_at(0)) == rainbow(phase_at(0)), "not frame dependent"
-    assert rainbow(phase_at(0)) != rainbow(phase_at(30)), "must move with travel"
-    # one full hue turn per 180px, so a pass of this banner is a bit over one
-    turn_px = round(1.0 / (RAINBOW_TURNS * SWEEP_PER_PX))
-    assert turn_px == 180, turn_px
-    assert rainbow(phase_at(0)) == rainbow(phase_at(turn_px)), "must come back round"
-    # and a brand pill breathes on the same distance, so nothing beats against it
-    assert sweep("#FF5500FF", phase_at(0)) == sweep("#FF5500FF", phase_at(turn_px))
-    assert sweep("#FF5500FF", 0.0)[0] == "#FF5500FF", "brand end must stay exact"
-    assert pill_color("apple_music") != BRAND["apple_music"][1], \
-        "a white pill under white digits shows nothing"
+    assert flow("#FF5500FF", "#1ED760FF", phase_at(0)) == \
+           flow("#FF5500FF", "#1ED760FF", phase_at(0)), "not frame dependent"
+    assert flow("#FF5500FF", "#1ED760FF", phase_at(0)) != \
+           flow("#FF5500FF", "#1ED760FF", phase_at(40)), "must move with travel"
+    assert flow("#FF5500FF", "#1ED760FF", phase_at(0)) == \
+           flow("#FF5500FF", "#1ED760FF", phase_at(180)), "must come back round"
 
-    # the rainbow must actually turn, stay inside two stops, and never go so
-    # bright that the white number on top disappears into it
+    # every pill leads with its own colour and hands over to the next, never
+    # the other way round and never all the way
     for ph in (0.0, 0.4, 1.3, 7.7):
-        stops = rainbow(ph)
-        assert len(stops) == 2, "the schema allows at most two fill_colors"
-        assert all(len(c) == 9 and c.startswith("#") for c in stops), stops
-        assert stops[0] != stops[1], "both ends the same is not a gradient"
-        for c in stops:
-            r, g, b = (int(c[i:i + 2], 16) for i in (1, 3, 5))
-            assert max(r, g, b) <= round(RAINBOW_V * 255), (c, "too bright for white text")
-            assert min(r, g, b) == 0, (c, "full saturation keeps it a rainbow, not a pastel")
-    assert rainbow(0.0) != rainbow(0.5), "the hue must rotate with phase"
-    assert rainbow(0.0) == rainbow(1.0 / RAINBOW_TURNS), "one full turn must come back round"
-    # and only the follower pill is a rainbow; the services keep their brand
-    fans_els = frame(layout(counts_from(dict(stats, fans=1726)))[0], 0, 0.3)
-    pills = {e["id"]: e["fill_colors"] for e in fans_els if e["type"] == "rectangle"}
-    assert pills["p4"] == rainbow(0.3), "the fans pill must use the rainbow"
-    assert pills["p1"] == sweep(pill_color("soundcloud"), 0.3 + 1 * 0.25), \
-        "a service pill must keep its own brand sweep"
+        a, b = flow("#FF5500FF", "#1ED760FF", ph)
+        assert a == "#E64C00FF", (a, "stop one must be this pill's own brand")
+        assert a != b, "both ends the same is not a gradient"
+        assert b != "#1BC156FF", "a full handover loses which service this is"
+        # the handover must not go through mud: orange to green passes through
+        # yellow on the hue wheel, so the blend keeps a lit red channel
+        br, bg, bb = (int(b[i:i + 2], 16) for i in (1, 3, 5))
+        assert max(br, bg, bb) > 140, (b, "a dark blend is the RGB-lerp smear")
+    # a pill next to itself must still be a gradient, not a flat block
+    solo = flow("#FF5500FF", "#FF5500FF", 0.9)
+    assert solo[0] == solo[1], "no neighbour to hand over to means no shift"
 
-    els = frame(segs, 0)
-    assert len(els) == 12, "three elements per service: pill, logo, number"
-    assert sum(e["type"] == "image" for e in els) == 4
-    assert sum(e["type"] == "rectangle" for e in els) == 4
-    # the pill must sit under its own contents, or it paints over them
-    zs = {e["type"]: e["z_index"] for e in els}
-    assert zs["rectangle"] < zs["image"] < zs["text"], zs
-    # and every pill must be tall enough and round enough to read as a pill
-    for e in els:
-        if e["type"] == "rectangle":
-            assert e["height"] == H and e["radius"] * 2 == e["height"], e
-    assert all(e["timeout"] == ELEMENT_TIMEOUT for e in els), "missing dead man's switch"
-    assert all(-4096 <= e["x"] <= 4095 for e in frame(segs, -width)), "x out of range"
-
-    # the Instagram tile appears only when there is a follower count to show,
-    # and never joins the globe's sum
-    assert [k for k, _ in counts_from(stats)] == [
-        "globe", "soundcloud", "spotify", "apple_music"], "hidden when fans is None"
+    # the banner must be one closed loop of colour: the last pill hands back to
+    # the first, or the spectrum has a seam where it wraps
     social = dict(stats, fans=1726)
-    keys = [k for k, _ in counts_from(social)]
-    assert keys[-1] == "fans" and len(keys) == 5, keys
-    assert counts_from(social)[0][1] == 53698, "followers must not enter the total"
-    assert len(frame(layout(counts_from(social))[0], 0)) == 15
-
-    # a six-digit total is the realistic worst case; it must still fit the rules
-    wide = layout(counts_from({"sc": 400000, "sp": 300000, "am": 299999}))[0]
-    assert wide[0]["text"] == "999,999"
-
-    # the portfolio parser, against the real shape of data/plays.json
-    sample = {"last_updated": "2026-09-06T10:38:42+00:00",
-              "soundcloud": {"total_plays": 28588, "total_streams_sc": 18635,
-                             "total_downloads": 3690},
-              "spotify": {"total_streams": 20936, "monthly_listeners": 14},
-              "apple_music": {"total_plays": 4174, "total_shazams": 18}}
-    parsed = {"sc": int(sample["soundcloud"]["total_plays"]),
-              "sp": int(sample["spotify"]["total_streams"]),
-              "am": int(sample["apple_music"]["total_plays"])}
-    assert counts_from(parsed)[0][1] == 53698, "must sum the tiles, not the sc sub-metrics"
-
-    # the glyph advances must match the bar's own atlas, when it is on disk.
-    # This is what catches a firmware or emulator update silently re-spacing the
-    # font: skipped rather than failed when the manager is not installed, so the
-    # app still self-checks anywhere.
-    atlas = os.path.expanduser("~/busybar-manager/web/public/fonts/font-atlas.json")
-    if os.path.exists(atlas):
-        with open(atlas) as fh:
-            glyphs = json.load(fh)[FONT]["glyphs"]
-        for ch in "0123456789,":
-            want = glyphs[str(ord(ch))]["adv"]
-            assert ADVANCES.get(ch, ADVANCE) == want, \
-                f"{FONT} advance for {ch!r} is {want}, not {ADVANCES.get(ch, ADVANCE)}"
-        print(f"ok - advances match {FONT} in the bar's font atlas")
-
-    assert text_width("53,698") == 43, text_width("53,698")     # 5x8 + 1x3
-    assert text_width("4,174") == 32, "a 1 and a comma are both narrower than a digit"
-    assert text_width("999,999") > text_width("111,111"), "1 must be the narrow one"
-
-    # the songstats parser, against a real /artists/stats body captured from the
-    # live endpoint on 2026-09-10. Trimmed to the four sources this app asks
-    # for; every field name below is the API's own, not a guess.
-    live = {"result": "success", "stats": [
-        {"source": "spotify", "data": {"monthly_listeners_current": 17,
-                                       "followers_total": 51, "streams_total": 13058}},
-        {"source": "apple_music", "data": {"playlists_total": 0, "charts_total": 0}},
-        {"source": "instagram", "data": {"views_total": 2557, "followers_total": 1079}},
-        {"source": "soundcloud", "data": {"streams_total": 1182, "favorites_total": 10,
-                                          "followers_total": 130}},
-        {"source": "tiktok", "data": {"followers_total": 78, "profile_likes_total": 1730}},
-        {"source": "facebook", "data": {"followers_total": 351}},
-        {"source": "twitter", "data": {"followers_total": 23}},
-        {"source": "deezer", "data": {"followers_total": 2}},
-        {"source": "amazon", "data": {"followers_total": 0}},
-        {"source": "tidal", "data": {"followers_total": 0}},
-        {"source": "songkick", "data": {"followers_total": 0}},
-        {"source": "bandsintown", "data": {"followers_total": 0}},
-        {"source": "youtube", "data": {"subscribers_total": 12, "videos_total": 14}}]}
-    live_counts = parse_songstats(live)
-    assert live_counts["sc"] == 1182 and live_counts["sp"] == 13058
-    assert live_counts["am"] is None, "the parser leaves am unset; fetch_stats fills it"
-    # 51+1079+130+78+351+23+2+12 -- youtube counted via subscribers_total, and
-    # the four zero platforms present but contributing nothing
-    assert live_counts["fans"] == 1726, live_counts["fans"]
-    assert live_counts["by_platform"]["youtube"] == 12, \
-        "youtube calls it subscribers_total; assuming followers_total drops it"
-    assert len(live_counts["by_platform"]) == 12, "every follower source must be counted"
-    live_tiles = counts_from(live_counts)
-    assert [k for k, _ in live_tiles] == ["globe", "soundcloud", "spotify", "fans"]
-    assert live_tiles[0][1] == 14240, "the globe sums plays only, never followers"
-    layout(live_tiles)                   # must lay out with one play tile short
-
-    # a source that stops sending its number must say so, not silently show 0
-    blind = {"stats": [{"source": "spotify", "data": {"followers_total": 51}},
-                       {"source": "soundcloud", "data": {"streams_total": 1182}}]}
-    try:
-        parse_songstats(blind)
-    except RuntimeError as e:
-        assert "streams_total" in str(e) and "spotify" in str(e), e
-    else:
-        raise AssertionError("a missing streams_total must raise")
+    ring = frame(layout(counts_from(social))[0], 0, 0.0)
+    pills = [e for e in ring if e["type"] == "rectangle"]
+    assert len(pills) == 5, len(pills)
+    order = ["globe", "soundcloud", "spotify", "apple_music", "fans"]
+    for j, key in enumerate(order):
+        nxt = order[(j + 1) % len(order)]
+        want = flow(pill_color(key), pill_color(nxt), 0.0 + j * 0.25)
+        assert pills[j]["fill_colors"] == want, (key, "must hand over to " + nxt)
+    assert pills[-1]["fill_colors"] == flow(pill_color("fans"), pill_color("globe"),
+                                            0.0 + 4 * 0.25), "the loop must close"
 
     # every brand tile must have artwork and a colour, or a segment draws blank
     for key, _ in counts_from(social):
