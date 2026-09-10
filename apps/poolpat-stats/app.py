@@ -789,10 +789,22 @@ def prepare(host, source, stats):
 LABELS = {"globe": "TOTAL", "soundcloud": "SOUNDCLOUD", "spotify": "SPOTIFY",
           "apple_music": "APPLE MUSIC", "fans": "FANS"}
 SEPARATOR = "   "                        # blank run between one service and the next
-SCROLL_PPM = 3600                        # pixels per MINUTE: 60 px/s
+# Pixels per MINUTE. 1800 = 30 px/s, a reading pace: the scroll is for reading,
+# not for showing off the panel. It is deliberately half the gradient's rate --
+# the firmware renders the text at 60 Hz either way, so a slower scroll costs no
+# smoothness, it just gives the eye time on each number.
+SCROLL_PPM = 1800
 SCROLL_START_MS = 600
 SCROLL_REPEAT_MS = 1500
 TEXT_X, TEXT_W = 4, 64                   # the label window, inset inside the pill
+
+# The pill is drawn one pixel larger than the display on every side, so its 1px
+# border falls exactly on the pixels that were black before -- the display edge
+# becomes the outline instead of a gap. The border colour is the gradient's own
+# negative, which is what makes it read as an edge at every point of the cycle:
+# a border sharing the fill's hue disappears into it as the colour travels.
+PILL_BLEED = 1
+BORDER_W = 1
 # Pill recolours per second. The firmware scrolls the text at panel rate on its
 # own; this is only how often the colour under it is refreshed, and at 60 px/s a
 # 60 Hz recolour moves the gradient exactly one pixel per update -- in step with
@@ -802,7 +814,7 @@ TEXT_X, TEXT_W = 4, 64                   # the label window, inset inside the pi
 # fifteen-element host-rendered banner. One element is what makes 60 reachable
 # here when it is not there at all. The loop still measures and holds a cadence,
 # so a slower cable simply settles lower instead of falling behind.
-RECOLOUR_HZ = 60
+RECOLOUR_HZ = 60          # the gradient's own rate, independent of the scroll
 
 
 def strip(counts):
@@ -907,11 +919,28 @@ def window_colors(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
             color_at(marks, total, px + TEXT_W, floor, ceiling)]
 
 
+def negative(color):
+    """The opposite hue at full value: an outline that never blends into the fill.
+
+    ponytail: opposite hue, not inverted RGB. Inverting the bytes of a mid-grey
+    gives another mid-grey, so the border would vanish exactly where the
+    gradient passes through its dullest point -- which is the one place an edge
+    is most needed.
+    """
+    r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    h, sat, _ = colorsys.rgb_to_hsv(r, g, b)
+    nr, ng, nb = colorsys.hsv_to_rgb((h + 0.5) % 1.0, sat, 1.0)
+    return "#%02X%02X%02XFF" % (round(nr * 255), round(ng * 255), round(nb * 255))
+
+
 def device_frame(text, colors):
     return [
-        {"id": "pill", "type": "rectangle", "x": 0, "y": 0,
-         "width": W, "height": PILL_H, "radius": PILL_R,
-         "fill": "gradient_h", "fill_colors": colors, "border_width": 0,
+        {"id": "pill", "type": "rectangle",
+         "x": -PILL_BLEED, "y": -PILL_BLEED,
+         "width": W + 2 * PILL_BLEED, "height": PILL_H + 2 * PILL_BLEED,
+         "radius": (PILL_H + 2 * PILL_BLEED) // 2,
+         "fill": "gradient_h", "fill_colors": colors,
+         "border_width": BORDER_W, "border_color": negative(colors[0]),
          "align": "top_left", "z_index": 0, "timeout": ELEMENT_TIMEOUT},
         {"id": "txt", "type": "text", "text": text, "font": FONT, "color": NUMBER,
          "x": TEXT_X, "y": H // 2, "align": "mid_left", "width": TEXT_W,
@@ -941,25 +970,44 @@ def run_device(args, stats):
     next_fetch = started + args.refresh
     blocked = False
     ticks, reported, beat, due = 0, started, 1.0 / RECOLOUR_HZ, started
+    last_colors, sent, sent_skipped = None, 0, 0
+    calibrating, calibrated, calib_from = 0, False, started
     try:
         while True:
             now = time.monotonic()
             # Where the firmware has scrolled to by now, from its own rate.
             px = (now - started - SCROLL_START_MS / 1000.0) * (SCROLL_PPM / 60.0)
             px = max(0.0, px)
-            colors = window_colors(marks, total, px, args.dim, args.bright)
-            try:
-                status, body = draw(args.host, device_pill(colors))
-            except urllib.error.URLError as e:
-                print(f"skipped a recolour ({e.reason})")
+            # Quantise to whole pixels of travel, then send only on change.
+            # The gradient is a function of position, so at 30 px/s there are
+            # only 30 distinct colours per second no matter how often this loop
+            # wakes: ticking faster than that produces duplicate draws, not a
+            # smoother gradient. Waking at 60 and sending ~30 is what keeps the
+            # colour on the very next pixel without wasting a POST on a repeat.
+            colors = window_colors(marks, total, float(int(px)), args.dim, args.bright)
+            if colors == last_colors:
+                sent_skipped += 1
+                status, body = 200, ""
             else:
-                if status >= 300:
-                    if not blocked:
-                        print(f"{status} {body.strip()} - holding until the screen frees up")
-                        blocked = True
-                elif blocked:
-                    print("screen free again")
-                    blocked = False
+                last_colors = colors
+                try:
+                    status, body = draw(args.host, device_pill(colors))
+                except urllib.error.URLError as e:
+                    print(f"skipped a recolour ({e.reason})")
+                    status, body = 200, ""
+                else:
+                    sent += 1
+
+            # 409 means a BUSY session owns the screen. Routine, not a fault:
+            # keep ticking so the pill returns the moment the session ends.
+            if status >= 300:
+                if not blocked:
+                    print(f"{status} {body.strip()} - holding until the screen frees up")
+                    blocked = True
+                last_colors = None      # force a resend once the screen is free
+            elif blocked:
+                print("screen free again")
+                blocked = False
 
             if stats["as_of"] != "pinned" and now >= next_fetch:
                 next_fetch = now + args.refresh
@@ -975,16 +1023,27 @@ def run_device(args, stats):
                         draw(args.host, device_frame(text, colors))
                         print(f"updated: {total}px")
             ticks += 1
-            if ticks == CADENCE_SAMPLE and beat == 1.0 / RECOLOUR_HZ:
-                rate = CADENCE_SAMPLE / (time.monotonic() - started)
+            if not calibrated:
+                calibrating += 1
+            # ponytail: calibrate ONCE, against its own start time and its own
+            # counter. Keying this off `ticks` re-fired every time the profile
+            # printer reset that counter, and each re-fire measured against a
+            # long-stale `started` -- which read as 3.7/s and pinned the loop at
+            # 3.2 Hz. A latch is the fix; the symptom was a gradient that
+            # smoothly ran, then crawled.
+            if not calibrated and calibrating >= CADENCE_SAMPLE:
+                rate = CADENCE_SAMPLE / max(1e-6, time.monotonic() - calib_from)
                 if rate < RECOLOUR_HZ:
                     beat = 1.0 / max(1.0, rate * CADENCE_HEADROOM)
+                calibrated = True                # never again
                 if args.profile:
                     print(f"measured {rate:.1f} recolours/s; holding {1 / beat:.1f} Hz")
             if args.profile and now - reported >= 5.0:
-                print(f"{ticks / (now - reported):.1f} Hz recolour, "
-                      f"firmware scrolling at {SCROLL_PPM / 60:.0f} px/s")
-                ticks, reported = 0, now
+                span = now - reported
+                print(f"{ticks / span:.1f} Hz tick, {sent / span:.1f} Hz sent, "
+                      f"{sent_skipped / span:.1f} Hz deduped, "
+                      f"text {SCROLL_PPM / 60:.0f} px/s on the firmware")
+                ticks, reported, sent, sent_skipped = 0, now, 0, 0
             due += beat
             time.sleep(max(0.0, due - time.monotonic()))
             if due < time.monotonic() - 1.0:
@@ -1245,7 +1304,33 @@ def self_check():
     # equal floor and ceiling switches the wave off, which is what --dim==--bright is for
     assert len({round(brightness_at(x, total, 0.8, 0.8), 6) for x in range(50)}) == 1
     # at 60 px/s a 60 Hz recolour moves the gradient one pixel per update
-    assert abs(SCROLL_PPM / 60.0 / RECOLOUR_HZ - 1.0) < 1e-9, "colour must keep step"
+    # the gradient runs at twice the scroll: 60 Hz of colour over 30 px/s of
+    # text, so the colour advances half a pixel per update and never steps
+    assert (SCROLL_PPM / 60.0) / RECOLOUR_HZ <= 1.0, "colour must not lag the scroll"
+    assert RECOLOUR_HZ == 2 * (SCROLL_PPM / 60.0), "60 Hz gradient, 30 px/s text"
+
+    # the border is the gradient's negative, so it stays visible all cycle
+    for c in ("#FF5500FF", "#1ED760FF", "#808080FF", "#5B4FE9FF", "#FA243CFF"):
+        n = negative(c)
+        ch, cs, _ = colorsys.rgb_to_hsv(*(int(c[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
+        nh, _, nv = colorsys.rgb_to_hsv(*(int(n[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
+        assert nv > 0.99, (n, "the outline must stay bright enough to read as one")
+        if cs > 0.05:
+            # 0.01 of a turn, not exact: the result is quantised to 8 bits per
+            # channel on the way out, which moves the hue slightly
+            assert abs(((nh - ch) % 1.0) - 0.5) < 0.01, (c, n, "opposite hue")
+        else:
+            # grey has no hue to oppose, so its negative is simply white --
+            # still an outline, which is the point
+            assert n == "#FFFFFFFF", n
+
+    # the pill overhangs the display so its border lands on the edge pixels
+    pill = device_frame("x", ["#FF5500FF", "#1ED760FF"])[0]
+    assert pill["x"] == -PILL_BLEED and pill["y"] == -PILL_BLEED
+    assert pill["width"] == W + 2 and pill["height"] == H + 2, pill
+    assert pill["radius"] * 2 == pill["height"], "still a pill, not a rounded box"
+    assert pill["border_width"] == BORDER_W == 1
+    assert pill["border_color"] == negative("#FF5500FF")
 
     # the gradient must SCROLL: the two stops differ wherever a boundary is
     # inside the window, and both stops move as the scroll advances
@@ -1279,6 +1364,17 @@ def self_check():
     host_frame = frame(layout(counts_from(social))[0], 0, 0.0)
     assert len(device_pill(["#000000FF", "#000000FF"])) * 5 < len(host_frame), \
         "a recolour must stay far cheaper than a host frame"
+
+    # the cadence latch: it must calibrate once and stay calibrated, however
+    # often the profile counter is reset underneath it
+    calibrating, calibrated, fired = 0, False, 0
+    for _ in range(CADENCE_SAMPLE * 4):
+        if not calibrated:
+            calibrating += 1
+        if not calibrated and calibrating >= CADENCE_SAMPLE:
+            fired += 1
+            calibrated = True
+    assert fired == 1, f"calibrated {fired} times; a re-fire pins the loop slow"
 
     args = parse_args([])
     assert args.render == "device", "the firmware renders by default"
