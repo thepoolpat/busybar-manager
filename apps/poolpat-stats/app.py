@@ -197,17 +197,15 @@ FPS = 60                      # ceiling only; the measured rate always wins
 CADENCE_HEADROOM = 0.85       # run at 85% of what the device just proved it can do
 CADENCE_SAMPLE = 20           # frames to measure before pinning the cadence
 
-# Recolouring a gradient is not a reposition, and the difference is the whole
-# frame rate: eight reposition-only elements sustain ~34 draws/s where fifteen
-# gradient-filled ones managed 12. So the sweep gets its own much slower clock.
-# The pills still slide every frame; only their colours lag, and a highlight
-# that updates 6 times a second is indistinguishable from one that updates 60.
+# The gradient is driven by DISTANCE TRAVELLED, not by the wall clock. Tying it
+# to the scroll is what makes the colour feel like it belongs to the banner
+# rather than like a second animation running behind it: the light moves because
+# the pill moves, and if --speed changes, the colour follows without a constant
+# to retune. A stopped banner has a still gradient, which is the honest look.
 #
-# ponytail: this is the one lever that does not cost a pill or a logo. If the
-# banner still is not smooth after this, measure before cutting anything --
-# `--profile` prints the achieved rate.
-SWEEP_FPS = 6
-SWEEP_RATE = 0.45             # gradient phase units per second: one slow breath
+# One full hue rotation, and one breath of a brand pill, every 180px of travel
+# (2.0 phase units at this rate) -- fifteen seconds at the default 12 px/s.
+SWEEP_PER_PX = 1.0 / 90.0
 
 NUMBER = "#FFFFFFFF"
 # Since the pill carries the brand colour, the logo on top of it has to be the
@@ -772,11 +770,11 @@ def run(args):
         while True:
             try:
                 elapsed = time.monotonic() - started
-                offset = W - int(elapsed * args.speed) % (W + width)
-                # Quantise the sweep phase to its own slower clock so the same
-                # colours repeat across consecutive frames instead of being
-                # recomputed 60 times a second for no visible difference.
-                phase = int(elapsed * SWEEP_FPS) / SWEEP_FPS * SWEEP_RATE
+                travelled = int(elapsed * args.speed)     # whole pixels only
+                offset = W - travelled % (W + width)
+                # Same integer pixel count drives both, so the colour advances
+                # exactly when the banner does and never between steps.
+                phase = travelled * SWEEP_PER_PX
                 status, body = draw(args.host, frame(segs, offset, phase))
                 drawn += 1
             except urllib.error.URLError as e:
@@ -884,12 +882,19 @@ def self_check():
 
     # the gradient has to actually move, or it is just a two-tone fill
     assert sweep("#FF5500FF", 0.0) != sweep("#FF5500FF", 0.7), "sweep is static"
-    # the sweep clock must actually quantise, or it costs a frame rate for
-    # colours nobody can tell apart
-    q = lambda t: int(t * SWEEP_FPS) / SWEEP_FPS * SWEEP_RATE
-    assert q(0.00) == q(0.10), "frames inside one sweep tick must share a phase"
-    assert q(0.00) != q(0.20), "the sweep must still advance between ticks"
-    assert SWEEP_FPS < FPS, "a sweep clock at frame rate saves nothing"
+    # the gradient must be locked to travel, not to the clock: same pixel means
+    # same colour, a moved pixel means a moved colour, and a still banner is
+    # still in both senses
+    phase_at = lambda px: px * SWEEP_PER_PX
+    assert phase_at(7) == phase_at(7), "the same pixel must give the same phase"
+    assert rainbow(phase_at(0)) == rainbow(phase_at(0)), "not frame dependent"
+    assert rainbow(phase_at(0)) != rainbow(phase_at(30)), "must move with travel"
+    # one full hue turn per 180px, so a pass of this banner is a bit over one
+    turn_px = round(1.0 / (RAINBOW_TURNS * SWEEP_PER_PX))
+    assert turn_px == 180, turn_px
+    assert rainbow(phase_at(0)) == rainbow(phase_at(turn_px)), "must come back round"
+    # and a brand pill breathes on the same distance, so nothing beats against it
+    assert sweep("#FF5500FF", phase_at(0)) == sweep("#FF5500FF", phase_at(turn_px))
     assert sweep("#FF5500FF", 0.0)[0] == "#FF5500FF", "brand end must stay exact"
     assert pill_color("apple_music") != BRAND["apple_music"][1], \
         "a white pill under white digits shows nothing"
