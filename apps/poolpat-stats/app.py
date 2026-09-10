@@ -48,6 +48,7 @@ because under the manager any exit at all is read as a crash and restarted.
 """
 import argparse
 import base64
+import colorsys
 import fcntl
 import json
 import os
@@ -171,15 +172,30 @@ SONGSTATS_ARTIST = "z0xl1iq2"   # from list_accessible_profiles, 2026-09-10
 # above a second or two is slack -- but if this process is SIGKILLed the last
 # frame would otherwise sit on the bar forever. 30s, then the bar drops it.
 ELEMENT_TIMEOUT = 30
-# The front panel refreshes at 60 Hz, so 60 is the ceiling worth aiming at and
-# the loop asks for it. What it actually gets is set by how fast the bar answers
-# a POST, and the loop finds that out by running: each draw blocks until the bar
-# replies, so the rate self-limits without a queue to back up. It sleeps only
-# when it is running ahead of 60, which on real hardware is never.
+# Cadence, and why it is not 30 or 60.
 #
-# Measured 2026-09-10 at 15 elements with the gradient recoloured every frame:
-# 12 draws/s. That is the number to beat, and SWEEP_FPS below is why it should.
-FPS = 60
+# The front panel refreshes at 60 Hz but the draw API cannot be driven near it.
+# Measured over USB on 2026-09-10, 60 consecutive draws each time:
+#
+#   15 elements, gradient recoloured every frame   12.8/s
+#   15 elements, static colours                    13.7/s
+#   10 elements                                    15.3/s
+#    5 elements, reposition only                   19.7/s
+#   15 elements over ONE keep-alive connection      1.8/s   <- do not do this
+#
+# That fits ~36 ms of fixed cost per POST plus ~3 ms per element, so even an
+# empty frame caps near 27/s. Keep-alive is the trap: the bar's HTTP server
+# stalls on a reused socket (median 77 ms, p90 1.5 s), so a fresh connection per
+# draw is the fast path, not the slow one. Do not "optimise" that away.
+#
+# So the app cannot render at 30 fps, and asking for it only makes frames arrive
+# unevenly. What it can do is hold a STEADY rate under the ceiling, which is the
+# thing the eye actually reads as smooth -- a jittery 14 looks worse than a
+# metronomic 11. CADENCE_HEADROOM is how far under the measured rate to sit so
+# that a slow frame is absorbed by the slack instead of pushing the next one late.
+FPS = 60                      # ceiling only; the measured rate always wins
+CADENCE_HEADROOM = 0.85       # run at 85% of what the device just proved it can do
+CADENCE_SAMPLE = 20           # frames to measure before pinning the cadence
 
 # Recolouring a gradient is not a reposition, and the difference is the whole
 # frame rate: eight reposition-only elements sustain ~34 draws/s where fifteen
@@ -369,6 +385,32 @@ def pill_color(key):
     return PILL_COLOR.get(key, BRAND[key][1])
 
 
+# ponytail: a rectangle takes at most two fill_colors (the schema says
+# maxItems: 2), so a rainbow cannot be painted as a multi-stop gradient. What it
+# can be is two stops that travel round the hue wheel together, which reads as a
+# rainbow moving through the pill rather than a static band of one. `spread` is
+# how far apart the two ends sit on the wheel: much wider and the pill's two
+# halves stop looking related, much narrower and it is a one-colour pill again.
+RAINBOW_SPREAD = 0.3                     # ~110 degrees of hue across the pill
+RAINBOW_TURNS = 0.5                      # hue revolutions per sweep phase unit
+RAINBOW_V = 0.9                          # not 1.0: white digits need somewhere
+                                         # to sit against yellow and cyan
+
+
+def rainbow(phase):
+    """Two hue-wheel stops a fixed distance apart, both rotating with phase.
+
+    Full saturation, because a desaturated rainbow on a 72x16 panel just reads
+    as mud. The value is held slightly under 1.0 so the white number on top
+    keeps its contrast where the wheel passes through yellow.
+    """
+    def stop(h):
+        r, g, b = colorsys.hsv_to_rgb(h % 1.0, 1.0, RAINBOW_V)
+        return "#%02X%02X%02XFF" % (round(r * 255), round(g * 255), round(b * 255))
+    turn = phase * RAINBOW_TURNS
+    return [stop(turn), stop(turn + RAINBOW_SPREAD)]
+
+
 def sweep(color, phase):
     """A brand colour and the darker end of its gradient, for this phase.
 
@@ -399,7 +441,10 @@ def frame(segs, offset, phase=0.0):
                     "x": s["pill_x"] + offset, "y": 0,
                     "width": s["pill_w"], "height": PILL_H, "radius": PILL_R,
                     "fill": "gradient_h",
-                    "fill_colors": sweep(pill_color(s["key"]), phase + i * 0.25),
+                    # The follower pill is every platform at once, so it gets
+                    # every colour at once rather than any one service's.
+                    "fill_colors": (rainbow(phase) if s["key"] == "fans"
+                                    else sweep(pill_color(s["key"]), phase + i * 0.25)),
                     "border_width": 0, "align": "top_left",
                     "z_index": 0, "timeout": ELEMENT_TIMEOUT})
         els.append({"id": f"i{i}", "type": "image", "path": f"{s['key']}.png",
@@ -718,6 +763,7 @@ def run(args):
     started = time.monotonic()
     offset = W
     drawn = 0
+    gaps = []
     reported = started
     due = time.monotonic()
     next_fetch = time.monotonic() + args.refresh
@@ -767,14 +813,32 @@ def run(args):
                               f"am={stats['am']} ({width}px)")
 
             now = time.monotonic()
+
+            # First CADENCE_SAMPLE frames run flat out purely to find out what
+            # this bar, on this cable, with this many elements, will actually
+            # take. Then the cadence is pinned just under that and held, so
+            # every later frame lands on a predictable beat.
+            if drawn == CADENCE_SAMPLE and step == 1.0 / FPS:
+                rate = CADENCE_SAMPLE / (now - started)
+                step = 1.0 / max(1.0, rate * CADENCE_HEADROOM)
+                due = now
+                if args.profile:
+                    print(f"measured {rate:.1f} draws/s at {len(segs) * 3} "
+                          f"elements; holding {1 / step:.1f} fps")
+
             if args.profile and now - reported >= 5.0:
-                print(f"{drawn / (now - reported):.1f} draws/s "
-                      f"({len(segs) * 3} elements)")
-                drawn, reported = 0, now
+                late = sum(1 for g in gaps if g > step * 1.5)
+                spread = (max(gaps) - min(gaps)) * 1000 if gaps else 0.0
+                print(f"{drawn / (now - reported):.1f} fps, "
+                      f"frame gap spread {spread:.0f}ms, {late} late")
+                drawn, reported, gaps = 0, now, []
+
             due += step
-            # Only ever sleeps when running ahead of the panel's own 60 Hz;
-            # on real hardware the POST itself is the pacing.
+            # Sleep out the rest of this frame's slot. On a healthy frame there
+            # is real slack here, which is the whole point: the next draw starts
+            # on the beat rather than as soon as the last one happened to finish.
             time.sleep(max(0.0, due - now))
+            gaps.append(time.monotonic() - now)
             if due < now - 1.0:
                 due = now                # never bank a second of owed frames
     except KeyboardInterrupt:
@@ -829,6 +893,26 @@ def self_check():
     assert sweep("#FF5500FF", 0.0)[0] == "#FF5500FF", "brand end must stay exact"
     assert pill_color("apple_music") != BRAND["apple_music"][1], \
         "a white pill under white digits shows nothing"
+
+    # the rainbow must actually turn, stay inside two stops, and never go so
+    # bright that the white number on top disappears into it
+    for ph in (0.0, 0.4, 1.3, 7.7):
+        stops = rainbow(ph)
+        assert len(stops) == 2, "the schema allows at most two fill_colors"
+        assert all(len(c) == 9 and c.startswith("#") for c in stops), stops
+        assert stops[0] != stops[1], "both ends the same is not a gradient"
+        for c in stops:
+            r, g, b = (int(c[i:i + 2], 16) for i in (1, 3, 5))
+            assert max(r, g, b) <= round(RAINBOW_V * 255), (c, "too bright for white text")
+            assert min(r, g, b) == 0, (c, "full saturation keeps it a rainbow, not a pastel")
+    assert rainbow(0.0) != rainbow(0.5), "the hue must rotate with phase"
+    assert rainbow(0.0) == rainbow(1.0 / RAINBOW_TURNS), "one full turn must come back round"
+    # and only the follower pill is a rainbow; the services keep their brand
+    fans_els = frame(layout(counts_from(dict(stats, fans=1726)))[0], 0, 0.3)
+    pills = {e["id"]: e["fill_colors"] for e in fans_els if e["type"] == "rectangle"}
+    assert pills["p4"] == rainbow(0.3), "the fans pill must use the rainbow"
+    assert pills["p1"] == sweep(pill_color("soundcloud"), 0.3 + 1 * 0.25), \
+        "a service pill must keep its own brand sweep"
 
     els = frame(segs, 0)
     assert len(els) == 12, "three elements per service: pill, logo, number"
