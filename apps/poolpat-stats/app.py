@@ -2,7 +2,8 @@
 """Poolpat stats: live streaming numbers scrolling right to left across the bar.
 
     python3 app.py                        # BUSY Bar over USB (always 10.0.4.20)
-    python3 app.py --render host          # per-service pills and logos instead
+    python3 app.py --render device        # one firmware-scrolled label, starts instantly
+    python3 app.py --render host          # this process pushes every frame
     python3 app.py --source songstats     # live daily numbers, needs SONGSTATS_API_KEY
     python3 app.py --speed 6              # slower crawl, pixels per second
     python3 app.py --sc 28588 --sp 20936 --am 4174   # pin the numbers, skip fetching
@@ -811,7 +812,11 @@ BORDER_W = 1
 # edge shows the travelling colour itself rather than the rim's darker step --
 # the rim then only outlines the rounded ends, where a pill needs an edge and
 # a straight line cannot give it one.
-EDGE_H = 1
+# Two pixels, not one. The pill's rounded ends leave its four corners unlit, and
+# a 1px hairline only covered the outermost of the two dark rows at each end --
+# measured on the framebuffer, rows 0/1 and 14/15 had black at x=0 and x=71.
+# 2px covers both, so the banner reaches all four corners and no pixel is wasted.
+EDGE_H = 2
 # Pill recolours per second. The firmware scrolls the text at panel rate on its
 # own; this is only how often the colour under it is refreshed, and at 60 px/s a
 # 60 Hz recolour moves the gradient exactly one pixel per update -- in step with
@@ -993,6 +998,221 @@ def device_pill(colors):
     return [device_frame("", colors)[0]] + edge_lines(colors)
 
 
+# --- animation build ----------------------------------------------------------
+#
+# The third render path, and the only one that gets the logos AND panel-rate
+# motion at once: pre-render every frame of the scrolling banner into a .anim
+# file, upload it, and let the firmware play it. After the upload the host sends
+# nothing at all -- not a frame, not a recolour.
+#
+# The format is the firmware's own, from lib/anim_file/anim_file_format.h and
+# lib/toolbox/rle_encode.c, not guesswork:
+#
+#   header   36 bytes: "bicycle0", flags, w, h, colour format, FPS, the longest
+#            encoded frame, then the two chunk lengths and three counts
+#   sections one AnimFileSection, which must include one named "default"
+#            covering every display frame
+#   frames   per frame: encoding, duration in display frames, encoded length
+#
+# ponytail: the frames are captured FROM THE DEVICE rather than rasterised here.
+# Drawing each offset and reading /api/screen back costs about a minute once,
+# and buys exact fidelity -- the firmware's own font, its own rounded corners,
+# its own antialiasing -- against reimplementing all three and being subtly
+# wrong about each. The bar is the renderer; this is only the tape recorder.
+ANIM_SIG = b"bicycle0"
+ANIM_BGR888 = 0
+ANIM_RAW, ANIM_RLE = 0, 1
+ANIM_HEADER_LEN = 36
+RLE_BLOCK = 3                            # bytes per pixel in Bgr888
+RLE_MAX_BLOCKS = 127
+RLE_RUN_THRESHOLD = 3
+SETTLE_TRIES = 4                         # re-reads allowed before a frame is taken
+
+
+def rle_compress(src, blk=RLE_BLOCK):
+    """The firmware's RLE, byte for byte (lib/toolbox/rle_encode.c).
+
+    Opcode with the high bit SET means `count` literal blocks follow; with it
+    clear, one block follows and repeats `count` times. Runs shorter than the
+    threshold are cheaper left literal than given an opcode of their own.
+    """
+    out = bytearray()
+    n = len(src) // blk
+    i = 0
+    while i < n:
+        run = 1
+        while (run < RLE_MAX_BLOCKS and i + run < n
+               and src[(i + run) * blk:(i + run + 1) * blk] ==
+                   src[i * blk:(i + 1) * blk]):
+            run += 1
+        if run >= RLE_RUN_THRESHOLD:
+            out.append(run)
+            out += src[i * blk:(i + 1) * blk]
+            i += run
+        else:
+            # gather literals until a run worth encoding shows up
+            start = i
+            lit = 0
+            while i < n and lit < RLE_MAX_BLOCKS:
+                ahead = 1
+                while (ahead < RLE_RUN_THRESHOLD and i + ahead < n
+                       and src[(i + ahead) * blk:(i + ahead + 1) * blk] ==
+                           src[i * blk:(i + 1) * blk]):
+                    ahead += 1
+                if ahead >= RLE_RUN_THRESHOLD:
+                    break
+                lit += 1
+                i += 1
+            out.append(0x80 | lit)
+            out += src[start * blk:(start + lit) * blk]
+    return bytes(out)
+
+
+def rle_decompress(src, blk=RLE_BLOCK):
+    """Only used to prove the compressor round-trips before anything is shipped."""
+    out = bytearray()
+    i = 0
+    while i < len(src):
+        op = src[i]
+        i += 1
+        count = op & 0x7F
+        if op & 0x80:
+            out += src[i:i + count * blk]
+            i += count * blk
+        else:
+            out += src[i:i + blk] * count
+            i += blk
+    return bytes(out)
+
+
+def anim_pack(frames, fps, duration):
+    """Frames of BGR bytes -> a complete .anim file."""
+    body, longest = bytearray(), 0
+    for raw in frames:
+        packed = rle_compress(raw)
+        if len(packed) < len(raw):
+            encoding, data = ANIM_RLE, packed
+        else:
+            # A frame that RLE makes bigger is stored raw. Cheaper, and it keeps
+            # encoded_length inside its uint16 whatever the picture does.
+            encoding, data = ANIM_RAW, raw
+        longest = max(longest, len(data))
+        body += struct.pack("<BBH", encoding, duration, len(data)) + data
+
+    name = b"default\x00"
+    section = struct.pack("<IIIB", 0, len(frames) * duration - 1,
+                          ANIM_HEADER_LEN + 4 * 3 + 1 + len(name), duration) + name
+    header = (ANIM_SIG + struct.pack(
+        "<BBBBBHBIIIII",
+        0,                        # flags
+        W, H,
+        ANIM_BGR888,
+        fps,
+        longest,
+        0,                        # _unused[1]
+        len(section),
+        len(body),
+        1,                        # section_count
+        len(frames),              # file_frame_count
+        len(frames) * duration))  # display_frame_count
+    assert len(header) == ANIM_HEADER_LEN, len(header)
+    return bytes(header + section + body)
+
+
+def build_anim(args, stats):
+    """--build-anim: record the banner and leave the file on disk."""
+    blob = record_anim(args, stats)
+    with open(args.build_anim, "wb") as fh:
+        fh.write(blob)
+    print(f"wrote {args.build_anim}: {len(blob):,} bytes")
+    return 0
+
+
+def record_anim(args, stats):
+    """Record the banner off the device one offset at a time, then pack it."""
+    segs, width = layout(counts_from(stats))
+    total = W + width
+    duration = max(1, round(args.fps / max(1, args.speed)))
+    print(f"recording {total} frames of {width}px banner from the device "
+          f"({total * duration / args.fps:.1f}s per pass at {args.fps} fps, "
+          f"each frame held {duration})")
+
+    frames, retaken = [], 0
+    for i in range(total):
+        offset = W - i
+        draw(args.host, frame(segs, offset, i * SWEEP_PER_PX))
+        # ponytail: a draw returns as soon as the bar has ACCEPTED the elements,
+        # not once it has rendered them, so reading the framebuffer straight
+        # after can catch a frame with the pill moved and the number not yet --
+        # which plays back as digits that stutter against logos that do not.
+        # Wait for two identical reads: that is the frame having settled, and it
+        # costs one extra read per frame rather than a guessed sleep.
+        px = grab(args.host)
+        for _ in range(SETTLE_TRIES):
+            again = grab(args.host)
+            if again == px:
+                break
+            px = again
+            retaken += 1
+        # grab() hands back RGB; the file wants BGR, which is what the panel
+        # actually stores. Reversing here and not there keeps --shot correct.
+        frames.append(bytes(b for p in px for b in (p[2], p[1], p[0])))
+        if i % 50 == 0:
+            print(f"  {i}/{total}")
+    clear(args.host)
+    if retaken:
+        print(f"  {retaken} frames needed a re-read before they settled")
+
+    blob = anim_pack(frames, args.fps, duration)
+    raw_total = total * W * H * 3
+    print(f"packed {len(blob):,} bytes ({len(blob) / raw_total:.1%} of raw), "
+          f"{total} frames at {args.fps} fps")
+    return blob
+
+
+ANIM_ASSET = "banner.anim"
+
+
+def run_anim(args, stats):
+    """Record the banner, upload it, and hand the screen to the firmware.
+
+    Steady state costs nothing: after the upload this process sends no frames
+    and no recolours, it only wakes to see whether the numbers moved. They move
+    once a week, and a rebuild is about half a minute, so paying that to get the
+    logos back at panel rate is the right way round.
+    """
+    shown = None
+    try:
+        while True:
+            if counts_from(stats) != shown:
+                blob = record_anim(args, stats)
+                upload(args.host, ANIM_ASSET, blob)
+                draw(args.host, [{"id": "anim", "type": "animation",
+                                  "path": ANIM_ASSET, "loop": True,
+                                  "x": 0, "y": 0, "align": "top_left",
+                                  "z_index": 0, "timeout": 0}])
+                shown = counts_from(stats)
+                print(f"{len(blob):,} bytes on the bar, playing at {args.fps} fps "
+                      f"- this process is now idle")
+
+            time.sleep(args.refresh)
+            if stats["as_of"] == "pinned":
+                continue
+            try:
+                fresh = fetch_stats(args.source)
+            except Exception as e:                      # noqa: BLE001
+                print(f"refresh failed, keeping the last numbers ({e})")
+            else:
+                if counts_from(fresh) != shown:
+                    stats = fresh
+                    print(f"numbers moved, rebuilding: sc={stats['sc']} "
+                          f"sp={stats['sp']} am={stats['am']}")
+    except KeyboardInterrupt:
+        clear(args.host)
+        print("\ncleared")
+        return 0
+
+
 def run_device(args, stats):
     """Scroll on the firmware, recolour from the host. No frame loop."""
     text, marks, total = strip(counts_from(stats))
@@ -1112,6 +1332,12 @@ def run(args):
     print(f"{stats['as_of'] if stats['as_of'] == 'pinned' else args.source} "
           f"stats as of {stats['as_of']}: "
           f"sc={stats['sc']} sp={stats['sp']} am={stats['am']}")
+
+    if args.build_anim:
+        return build_anim(args, stats)
+
+    if args.render == "anim":
+        return run_anim(args, stats)
 
     if args.render == "device":
         return run_device(args, stats)
@@ -1429,8 +1655,45 @@ def self_check():
             calibrated = True
     assert fired == 1, f"calibrated {fired} times; a re-fire pins the loop slow"
 
+    # the RLE must be the firmware's, which means it has to round-trip and it
+    # has to actually compress the flat runs a pill is made of
+    for probe in (b"", bytes(30), bytes(range(30)),
+                  bytes([1, 2, 3]) * 200 + bytes([9, 9, 9]),
+                  bytes([7, 7, 7]) * 500):
+        packed = rle_compress(probe)
+        assert rle_decompress(packed) == probe, probe[:9]
+    flat = bytes([255, 85, 0]) * (W * H)          # a screen of one colour
+    assert len(rle_compress(flat)) < len(flat) // 50, "a flat frame must collapse"
+    # every opcode must stay inside one byte's worth of blocks
+    long_run = bytes([1, 2, 3]) * 900
+    assert all(op & 0x7F <= RLE_MAX_BLOCKS for op in rle_compress(long_run)[:1])
+    assert rle_decompress(rle_compress(long_run)) == long_run
+
+    # the container: header length and the counts the player reads back
+    two = [bytes([0, 0, 0]) * (W * H), bytes([9, 9, 9]) * (W * H)]
+    blob = anim_pack(two, 60, 2)
+    assert blob[:8] == ANIM_SIG, blob[:8]
+    (flags, aw, ah, fmt, fps, longest, _unused, sect_len, body_len,
+     sections, file_frames, display_frames) = struct.unpack(
+        "<BBBBBHBIIIII", blob[8:ANIM_HEADER_LEN])
+    assert (aw, ah) == (W, H) and fmt == ANIM_BGR888, (aw, ah, fmt)
+    assert fps == 60 and sections == 1
+    assert file_frames == 2 and display_frames == 4, "duration must multiply out"
+    assert len(blob) == ANIM_HEADER_LEN + sect_len + body_len, "chunk lengths must fit"
+    # the "default" section must cover every display frame, or the player has
+    # nothing to select, and its frame_offs must point at the frames chunk
+    start, end, offs, dur = struct.unpack("<IIIB", blob[ANIM_HEADER_LEN:ANIM_HEADER_LEN + 13])
+    assert (start, end) == (0, display_frames - 1), (start, end)
+    assert blob[ANIM_HEADER_LEN + 13:].startswith(b"default\x00")
+    assert offs == ANIM_HEADER_LEN + sect_len, (offs, "frames chunk must start here")
+    # and the first frame header must describe data that decodes to one screen
+    enc, fdur, elen = struct.unpack("<BBH", blob[offs:offs + 4])
+    assert fdur == 2 and elen <= longest
+    payload = blob[offs + 4:offs + 4 + elen]
+    assert (rle_decompress(payload) if enc == ANIM_RLE else payload) == two[0]
+
     args = parse_args([])
-    assert args.render == "device", "the firmware renders by default"
+    assert args.render == "anim", "the recorded animation is the default"
     assert pinned(args) is None, "no overrides means fetch"
     assert pinned(parse_args(["--sc", "1", "--sp", "2", "--am", "3"]))["sc"] == 1
     # the songstats shape must be rehearsable: no --am, so no Apple Music tile
@@ -1466,15 +1729,22 @@ def parse_args(argv=None):
     p.add_argument("--am", type=int, default=None, help="pin Apple Music plays, skip fetching")
     p.add_argument("--fans", type=int, default=None,
                    help="pin the all-platform follower total")
+    p.add_argument("--build-anim", metavar="FILE",
+                   help="record the banner off the device into a .anim file "
+                        "the firmware can play with no host traffic at all")
+    p.add_argument("--fps", type=int, default=60,
+                   help="frames per second written into the .anim header")
     p.add_argument("--dim", type=float, default=DIM_FLOOR,
                    help="brightness at the trough of the wave, 0-1 "
                         "(set equal to --bright for no wave)")
     p.add_argument("--bright", type=float, default=DIM_CEILING,
                    help="brightness at the crest of the wave, 0-1")
-    p.add_argument("--render", choices=("device", "host"), default="device",
-                   help="device: the firmware scrolls (smooth, no logos). "
-                        "host: this process pushes frames (logos and per-service "
-                        "pills, capped near 12 fps)")
+    p.add_argument("--render", choices=("anim", "device", "host"), default="anim",
+                   help="anim: record the banner to a .anim the firmware plays "
+                        "(logos AND 60 fps, no traffic once uploaded). "
+                        "device: the firmware scrolls one text label (smooth, "
+                        "no logos, instant start). "
+                        "host: this process pushes frames (logos, ~12 fps)")
     p.add_argument("--profile", action="store_true",
                    help="print the achieved draw rate every 5s")
     p.add_argument("--speed", type=int, default=12,
