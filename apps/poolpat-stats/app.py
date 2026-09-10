@@ -805,6 +805,13 @@ TEXT_X, TEXT_W = 4, 64                   # the label window, inset inside the pi
 # a border sharing the fill's hue disappears into it as the colour travels.
 PILL_BLEED = 1
 BORDER_W = 1
+
+# A 1px hairline along the very top and the very bottom, carrying the same
+# gradient as the pill. They sit above the pill's rim, so the display's outer
+# edge shows the travelling colour itself rather than the rim's darker step --
+# the rim then only outlines the rounded ends, where a pill needs an edge and
+# a straight line cannot give it one.
+EDGE_H = 1
 # Pill recolours per second. The firmware scrolls the text at panel rate on its
 # own; this is only how often the colour under it is refreshed, and at 60 px/s a
 # 60 Hz recolour moves the gradient exactly one pixel per update -- in step with
@@ -919,17 +926,32 @@ def window_colors(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
             color_at(marks, total, px + TEXT_W, floor, ceiling)]
 
 
-def negative(color):
-    """The opposite hue at full value: an outline that never blends into the fill.
+# How far the rim's brightness steps away from the fill it outlines. Enough to
+# read as an edge, not so much that it reads as a second colour.
+RIM_DARKEN = 0.45
+RIM_LIGHTEN = 0.35
+RIM_PIVOT = 0.55                # above this the fill is lit enough to rim darker
 
-    ponytail: opposite hue, not inverted RGB. Inverting the bytes of a mid-grey
-    gives another mid-grey, so the border would vanish exactly where the
-    gradient passes through its dullest point -- which is the one place an edge
-    is most needed.
+
+def rim(color):
+    """An outline in the fill's own hue: same colour, stepped in brightness.
+
+    ponytail: this replaced an opposite-hue border, which was legible but read
+    as a separate object stuck to the edge of the pill. Keeping the hue and
+    moving only the value keeps the whole pill one colour, so the outline
+    belongs to it.
+
+    The direction is chosen from the fill rather than fixed, because a fixed one
+    has nowhere to go at the ends of the range: darken a fill that is already
+    near black and there is no edge, lighten one already near white and the
+    same. Above RIM_PIVOT the rim goes darker, below it the rim goes lighter,
+    so there is always somewhere to step to -- which matters here precisely
+    because the brightness wave is always moving the fill up and down.
     """
     r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
-    h, sat, _ = colorsys.rgb_to_hsv(r, g, b)
-    nr, ng, nb = colorsys.hsv_to_rgb((h + 0.5) % 1.0, sat, 1.0)
+    h, sat, v = colorsys.rgb_to_hsv(r, g, b)
+    v = v * RIM_DARKEN if v > RIM_PIVOT else min(1.0, v + RIM_LIGHTEN)
+    nr, ng, nb = colorsys.hsv_to_rgb(h, sat, v)
     return "#%02X%02X%02XFF" % (round(nr * 255), round(ng * 255), round(nb * 255))
 
 
@@ -940,7 +962,7 @@ def device_frame(text, colors):
          "width": W + 2 * PILL_BLEED, "height": PILL_H + 2 * PILL_BLEED,
          "radius": (PILL_H + 2 * PILL_BLEED) // 2,
          "fill": "gradient_h", "fill_colors": colors,
-         "border_width": BORDER_W, "border_color": negative(colors[0]),
+         "border_width": BORDER_W, "border_color": rim(colors[0]),
          "align": "top_left", "z_index": 0, "timeout": ELEMENT_TIMEOUT},
         {"id": "txt", "type": "text", "text": text, "font": FONT, "color": NUMBER,
          "x": TEXT_X, "y": H // 2, "align": "mid_left", "width": TEXT_W,
@@ -950,9 +972,25 @@ def device_frame(text, colors):
     ]
 
 
+def edge_lines(colors):
+    """The top and bottom hairlines, in the gradient's own colours."""
+    return [
+        {"id": f"edge{i}", "type": "rectangle", "x": 0, "y": y,
+         "width": W, "height": EDGE_H, "radius": 0,
+         "fill": "gradient_h", "fill_colors": colors, "border_width": 0,
+         "align": "top_left", "z_index": 1, "timeout": ELEMENT_TIMEOUT}
+        for i, y in enumerate((0, H - EDGE_H))
+    ]
+
+
 def device_pill(colors):
-    """Just the pill, by id -- leaves a mid-scroll text element alone."""
-    return [device_frame("", colors)[0]]
+    """The pill and its hairlines, by id -- never the mid-scroll text element.
+
+    ponytail: three elements, not one, and still nowhere near a frame. What
+    matters is that the text element is absent, because resending it is what
+    would restart the firmware's scroll.
+    """
+    return [device_frame("", colors)[0]] + edge_lines(colors)
 
 
 def run_device(args, stats):
@@ -965,8 +1003,8 @@ def run_device(args, stats):
     if not 0.0 <= args.dim <= args.bright <= 1.0:
         raise SystemExit("--dim must be between 0 and --bright, and --bright at most 1")
     print(f"brightness wave {args.dim:.2f}-{args.bright:.2f} every {PULSE_PX}px")
-    draw(args.host, device_frame(
-        text, window_colors(marks, total, 0.0, args.dim, args.bright)))
+    first = window_colors(marks, total, 0.0, args.dim, args.bright)
+    draw(args.host, device_frame(text, first) + edge_lines(first))
     next_fetch = started + args.refresh
     blocked = False
     ticks, reported, beat, due = 0, started, 1.0 / RECOLOUR_HZ, started
@@ -1309,20 +1347,24 @@ def self_check():
     assert (SCROLL_PPM / 60.0) / RECOLOUR_HZ <= 1.0, "colour must not lag the scroll"
     assert RECOLOUR_HZ == 2 * (SCROLL_PPM / 60.0), "60 Hz gradient, 30 px/s text"
 
-    # the border is the gradient's negative, so it stays visible all cycle
-    for c in ("#FF5500FF", "#1ED760FF", "#808080FF", "#5B4FE9FF", "#FA243CFF"):
-        n = negative(c)
-        ch, cs, _ = colorsys.rgb_to_hsv(*(int(c[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
+    # the border shares the fill's hue -- coherent, not contrasting -- and is
+    # always far enough away in brightness to still read as an edge
+    for c in ("#FF5500FF", "#1ED760FF", "#5B4FE9FF", "#FA243CFF",
+              "#101010FF", "#F8F8F8FF", "#808080FF"):
+        n = rim(c)
+        ch, cs, cv = colorsys.rgb_to_hsv(*(int(c[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
         nh, _, nv = colorsys.rgb_to_hsv(*(int(n[i:i + 2], 16) / 255.0 for i in (1, 3, 5)))
-        assert nv > 0.99, (n, "the outline must stay bright enough to read as one")
         if cs > 0.05:
-            # 0.01 of a turn, not exact: the result is quantised to 8 bits per
-            # channel on the way out, which moves the hue slightly
-            assert abs(((nh - ch) % 1.0) - 0.5) < 0.01, (c, n, "opposite hue")
-        else:
-            # grey has no hue to oppose, so its negative is simply white --
-            # still an outline, which is the point
-            assert n == "#FFFFFFFF", n
+            assert abs(((nh - ch + 0.5) % 1.0) - 0.5) < 0.01, (c, n, "hue must not shift")
+        assert abs(nv - cv) > 0.12, (c, n, "too close to the fill to read as an edge")
+    # a near-black fill must rim lighter and a near-white fill must rim darker,
+    # or the edge disappears at the ends of the brightness wave
+    assert rim("#101010FF") > "#101010FF", "dark fill needs a lighter rim"
+    dark_v = colorsys.rgb_to_hsv(*(int(rim("#F8F8F8FF")[i:i + 2], 16) / 255.0
+                                   for i in (1, 3, 5)))[2]
+    assert dark_v < 0.6, "bright fill needs a darker rim"
+    # and it must track the fill as the gradient travels
+    assert rim("#FF5500FF") != rim("#1ED760FF"), "the rim must follow the fill"
 
     # the pill overhangs the display so its border lands on the edge pixels
     pill = device_frame("x", ["#FF5500FF", "#1ED760FF"])[0]
@@ -1330,7 +1372,7 @@ def self_check():
     assert pill["width"] == W + 2 and pill["height"] == H + 2, pill
     assert pill["radius"] * 2 == pill["height"], "still a pill, not a rounded box"
     assert pill["border_width"] == BORDER_W == 1
-    assert pill["border_color"] == negative("#FF5500FF")
+    assert pill["border_color"] == rim("#FF5500FF")
 
     # the gradient must SCROLL: the two stops differ wherever a boundary is
     # inside the window, and both stops move as the scroll advances
@@ -1357,13 +1399,24 @@ def self_check():
     assert len(els) == 2 and els[1]["scroll_rate"] == SCROLL_PPM
     assert els[1]["width"] == TEXT_W and els[1]["x"] == TEXT_X
     assert TEXT_X + TEXT_W <= W, "the label window must fit inside the display"
-    assert [e["id"] for e in device_pill(["#000000FF", "#000000FF"])] == ["pill"], \
-        "a recolour must send the pill alone, or the scroll restarts"
+    recolour = device_pill(["#FF5500FF", "#1ED760FF"])
+    assert [e["id"] for e in recolour] == ["pill", "edge0", "edge1"], \
+        "a recolour must never carry the text element, or the scroll restarts"
+    assert all(e["type"] == "rectangle" for e in recolour)
+    # the hairlines hug the very top and bottom row, full width, and carry the
+    # same travelling colours as the pill they sit on
+    top, bot = recolour[1], recolour[2]
+    assert (top["y"], top["height"]) == (0, EDGE_H), top
+    assert bot["y"] + bot["height"] == H, bot
+    assert top["width"] == bot["width"] == W, "hairlines must span the display"
+    assert top["radius"] == bot["radius"] == 0, "a hairline is not a pill"
+    assert top["fill_colors"] == bot["fill_colors"] == recolour[0]["fill_colors"]
+    assert top["z_index"] > recolour[0]["z_index"], "must sit above the pill's rim"
     # a recolour is one element where a host frame is fifteen, which is the whole
     # reason 60 is reachable here and 13 was the ceiling there
     host_frame = frame(layout(counts_from(social))[0], 0, 0.0)
-    assert len(device_pill(["#000000FF", "#000000FF"])) * 5 < len(host_frame), \
-        "a recolour must stay far cheaper than a host frame"
+    assert len(device_pill(["#000000FF", "#000000FF"])) * 2 <= len(host_frame), \
+        "a recolour must stay well cheaper than a host frame"
 
     # the cadence latch: it must calibrate once and stay calibrated, however
     # often the profile counter is reset underneath it
