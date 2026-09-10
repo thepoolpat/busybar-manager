@@ -1,0 +1,7 @@
+name: Poolpat Stats
+author: thepoolpat
+description: "Live Poolpat play counts scrolling across the bar: combined total, SoundCloud, Spotify and Apple Music, each with its brand logo. Reads the portfolio repo by default, or the Songstats API when SONGSTATS_API_KEY is set."
+tags:
+  - music
+  - stats
+  - info
