@@ -8,6 +8,8 @@
     python3 app.py --speed 6              # slower crawl, pixels per second
     python3 app.py --fps 60 --speed 30    # panel-synced: 2 refreshes per pixel
     python3 app.py --render device --pause 0   # firmware scroll, no loop pause
+    # --render anim caches its recording under .anim-cache/; a restart with
+    # unchanged numbers reuses it and skips the 15-75s device capture
     python3 app.py --sc 28588 --sp 20936 --am 4174   # pin the numbers, skip fetching
     python3 app.py --sc 1182 --sp 13058 --fans 1726  # rehearse the songstats banner
     python3 app.py --shot banner.png      # save what the bar is showing, 8x
@@ -54,6 +56,7 @@ import argparse
 import base64
 import colorsys
 import fcntl
+import glob
 import json
 import math
 import os
@@ -61,6 +64,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -1388,6 +1392,56 @@ def record_anim(args, stats):
                      args.subpixel)
 
 
+# capture_frames() is the slow part of every restart: 440 live round trips to
+# the device, draw-then-reread-until-settled each time, which is what visibly
+# crawls across the panel for 15-75s before the real (smooth, pre-rendered)
+# loop takes over -- every restart pays it, because run_anim always starts
+# with shown=None. It doesn't need to: capture_frames() has nothing time-
+# varying in it, so the same numbers on the same layout always render the
+# same bytes, and a cache keyed on exactly those two things is provably safe
+# to reuse -- across a plain restart, or a bar-forgot-us recovery, whichever
+# numbers were already on the bar are still valid, no camera roll required.
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".anim-cache")
+
+
+def frame_cache_path(layout, counts):
+    key = "-".join(f"{k}{v}" for k, v in counts)
+    return os.path.join(CACHE_DIR, f"{layout}-{key}.frames")
+
+
+def load_cached_frames(layout, counts):
+    """The frames cached for these exact numbers, or None on any kind of miss
+    -- no file, a different layout or numbers, or a size that isn't a whole
+    number of frames (a partial write from a process killed mid-save)."""
+    try:
+        with open(frame_cache_path(layout, counts), "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    frame_size = W * H * 3
+    if not blob or len(blob) % frame_size:
+        return None
+    return [blob[i:i + frame_size] for i in range(0, len(blob), frame_size)]
+
+
+def save_cached_frames(layout, counts, frames):
+    """Cache these frames, and drop every other cache for this layout --
+    last week's numbers are worthless the moment this week's are on the bar,
+    and one file per layout is the only bound this cache needs."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for stale in glob.glob(os.path.join(CACHE_DIR, f"{layout}-*.frames")):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    path = frame_cache_path(layout, counts)
+    fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".tmp-")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(b"".join(frames))
+    os.replace(tmp, path)          # atomic: a crash mid-write can't leave a
+                                    # partial file at the real cache path
+
+
 def capture_frames(args, stats):
     """Record the banner off the device one offset at a time.
 
@@ -1473,11 +1527,23 @@ def run_anim(args, stats):
             if counts_from(stats) != shown:
                 want = counts_from(stats)
                 try:
-                    # One trip to the device, then a pass per --fps off the
-                    # same frames. The first rate is the one that plays; the
-                    # rest sit on the bar so switching between them is a
-                    # draw, not a re-record.
-                    frames = capture_frames(args, stats)
+                    # Skip the 15-75s live recording entirely when these exact
+                    # numbers, on this layout, are already sitting in the
+                    # cache -- a plain restart or a bar-forgot-us recovery,
+                    # the two cases that hit this block with nothing actually
+                    # having changed. A real change in the numbers always
+                    # misses (that's a different cache key) and re-records.
+                    frames = load_cached_frames(args.layout, want)
+                    if frames is None:
+                        # One trip to the device, then a pass per --fps off
+                        # the same frames. The first rate is the one that
+                        # plays; the rest sit on the bar so switching between
+                        # them is a draw, not a re-record.
+                        frames = capture_frames(args, stats)
+                        save_cached_frames(args.layout, want, frames)
+                    else:
+                        print("reusing the cached capture for these numbers "
+                              "- skipping the device recording")
                     tag = len(args.fps) > 1
                     for fps in args.fps:
                         upload(args.host, anim_asset(fps, tag),
@@ -2028,6 +2094,35 @@ def self_check():
     assert bar_probe_result(True, False) == (False, False)
     assert bar_probe_result(False, True) == (True, True)
     assert bar_probe_result(False, False) == (False, False)
+
+    # the frame cache: a restart or recovery with unchanged numbers must
+    # reuse the last capture, a real change in the numbers must not
+    global CACHE_DIR
+    real_cache_dir = CACHE_DIR
+    with tempfile.TemporaryDirectory() as td:
+        CACHE_DIR = td
+        try:
+            counts = [("globe", 100), ("soundcloud", 40)]
+            frames = [bytes([i]) * (W * H * 3) for i in range(3)]
+            assert load_cached_frames("strip", counts) is None, "no cache yet"
+            save_cached_frames("strip", counts, frames)
+            assert load_cached_frames("strip", counts) == frames, \
+                "cache round-trip must return identical bytes"
+            assert load_cached_frames("strip", [("globe", 999)]) is None, \
+                "different numbers must miss"
+            assert load_cached_frames("banner", counts) is None, \
+                "a different layout must miss even with the same numbers"
+            # last week's cache is replaced, not accumulated, by this week's
+            save_cached_frames("strip", [("globe", 999)], frames)
+            assert load_cached_frames("strip", counts) is None, \
+                "old numbers must be gone once new ones are cached"
+            assert len(os.listdir(CACHE_DIR)) == 1, "one cache file per layout"
+            # a truncated file (a process killed mid-write) is a miss, not a crash
+            with open(frame_cache_path("strip", [("globe", 999)]), "r+b") as fh:
+                fh.truncate(len(b"".join(frames)) - 1)
+            assert load_cached_frames("strip", [("globe", 999)]) is None
+        finally:
+            CACHE_DIR = real_cache_dir
 
     # sub-pixel: the blend fills the gaps between whole-pixel captures, keeps
     # the captures themselves untouched, and closes the loop at the wrap
