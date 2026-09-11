@@ -855,11 +855,24 @@ def strip(counts):
     return SEPARATOR.join(parts), marks, x
 
 
-# How far either side of a service boundary the colours blend. Wider than the
-# gap between two services would smear every colour into its neighbours; much
-# narrower and the pill changes colour in a visible step as a word crosses the
-# window edge.
-BLEND_PX = 34
+# How far either side of a service boundary the colours blend. This was a flat
+# 34px, which is WIDER THAN A TILE IS LONG -- the narrowest is 57px, so 34 at
+# each end covered it twice over and every pixel of the strip was mid-blend.
+# The gradient scrolled, but it scrolled through mud, and no service ever
+# actually showed its own brand colour. So derive it from the narrowest tile
+# instead of guessing: a quarter of it leaves each service at least half its
+# own width at full brand colour, and the cap keeps a very long tile from
+# smearing just because it can.
+BLEND_CAP = 34
+
+
+def blend_px(marks, total):
+    """Blend half-width for this strip, from its narrowest tile."""
+    if len(marks) < 2:
+        return 0
+    widths = [(marks[i + 1][0] if i + 1 < len(marks) else total) - marks[i][0]
+              for i in range(len(marks))]
+    return max(1, min(BLEND_CAP, min(widths) // 4))
 
 # Brightness is the third thing that travels, after position and hue. A pill
 # whose colour changes but whose luminance never does reads flat, because the
@@ -904,9 +917,10 @@ def color_at(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
     the left of the pill while Apple red is already arriving at the right.
 
     Pure brand colour through the middle of a service, blending across
-    BLEND_PX either side of each boundary and passing exactly half way at the
+    blend_px() either side of each boundary and passing exactly half way at the
     boundary itself, so no service ever hands over abruptly.
     """
+    blend = blend_px(marks, total)
     v = brightness_at(px, total, floor, ceiling)
     here = px % total
     i = len(marks) - 1
@@ -917,28 +931,51 @@ def color_at(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
     key = marks[i][1]
     start = marks[i][0]
     end = marks[i + 1][0] if i + 1 < len(marks) else total
-    if here - start < BLEND_PX:                  # arriving from the previous one
+    if here - start < blend:                     # arriving from the previous one
         prev = marks[i - 1][1]
         return mix(pill_color(prev), pill_color(key),
-                   0.5 + 0.5 * (here - start) / BLEND_PX, v)
-    if end - here < BLEND_PX:                    # handing over to the next one
+                   0.5 + 0.5 * (here - start) / blend, v)
+    if end - here < blend:                       # handing over to the next one
         nxt = marks[(i + 1) % len(marks)][1]
         return mix(pill_color(key), pill_color(nxt),
-                   0.5 * (BLEND_PX - (end - here)) / BLEND_PX, v)
+                   0.5 * (blend - (end - here)) / blend, v)
     return mix(pill_color(key), pill_color(key), 0.0, v)
+
+
+def grad_half(marks, total):
+    """Half the distance between the pill's two gradient stops.
+
+    The firmware takes at most TWO stops, so the pill is a straight line
+    between them. Sampling that line at the window's two edges is what made
+    every service read as mud on the icon layout: a tile is barely narrower
+    than the window, so both edges land in the handover to the neighbours and
+    the line runs blend-to-blend, never passing through the brand colour at all.
+
+    So sample inside the pure zone: as far apart as the narrowest tile allows
+    while both stops stay clear of its blends. Capped at half the window, which
+    is where the wide text-label tiles land -- they were never the broken case,
+    and this keeps them exactly as they were.
+    """
+    if len(marks) < 2:
+        return W / 2.0
+    widths = [(marks[i + 1][0] if i + 1 < len(marks) else total) - marks[i][0]
+              for i in range(len(marks))]
+    return max(4.0, min(W / 2.0, min(widths) / 2.0 - blend_px(marks, total)))
 
 
 def window_colors(marks, total, px, floor=DIM_FLOOR, ceiling=DIM_CEILING):
     """The two gradient stops for a window whose left edge is at px.
 
-    ponytail: the firmware never reports its scroll position, so px is
-    recomputed from scroll_rate and the clock. That is an open loop and can
-    drift out of step with the panel over a long run, which would show as the
-    colour leading or trailing the words. There is nothing to poll, so the fix
-    if it ever shows is a shorter strip, not a faster tick.
+    ponytail: on the device path px is recomputed from scroll_rate and the
+    clock, because the firmware never reports its scroll position. That is an
+    open loop and it drifts -- which is exactly why the recorded .anim is the
+    better path: there the colour and the words come from one number and cannot
+    disagree.
     """
-    return [color_at(marks, total, px, floor, ceiling),
-            color_at(marks, total, px + TEXT_W, floor, ceiling)]
+    half = grad_half(marks, total)
+    mid = px + W / 2.0
+    return [color_at(marks, total, mid - half, floor, ceiling),
+            color_at(marks, total, mid + half, floor, ceiling)]
 
 
 # How far the rim's brightness steps away from the fill it outlines. Enough to
@@ -987,15 +1024,65 @@ def device_frame(text, colors):
     ]
 
 
+# How far in from each side the pill's own silhouette starts, per row, working
+# inwards from the panel edge. MEASURED on the device by drawing the pill alone
+# and reading back the first lit pixel of each row: row 0 starts at x=2, row 1
+# at x=1, row 2 at x=0. Not derived from the radius, because PILL_BLEED and the
+# firmware's own antialiasing both move it.
+EDGE_INSET = (2, 1)
+
+
 def edge_lines(colors):
-    """The top and bottom hairlines, in the gradient's own colours."""
-    return [
-        {"id": f"edge{i}", "type": "rectangle", "x": 0, "y": y,
-         "width": W, "height": EDGE_H, "radius": 0,
-         "fill": "gradient_h", "fill_colors": colors, "border_width": 0,
-         "align": "top_left", "z_index": 1, "timeout": ELEMENT_TIMEOUT}
-        for i, y in enumerate((0, H - EDGE_H))
-    ]
+    """The top and bottom hairlines, in the gradient's own colours.
+
+    One rectangle per ROW rather than one EDGE_H-tall block per edge. A square
+    ended hairline lights the corner pixels the pill deliberately leaves dark,
+    which turns the pill's rounded end into a notched rectangle -- four lit
+    pixels in each corner that belong to nothing.
+    """
+    els = []
+    for i, inset in enumerate(EDGE_INSET[:EDGE_H]):
+        for edge, y in ((0, i), (1, H - 1 - i)):
+            els.append({"id": f"edge{edge}{i}", "type": "rectangle",
+                        "x": inset, "y": y,
+                        "width": W - 2 * inset, "height": 1, "radius": 0,
+                        "fill": "gradient_h", "fill_colors": colors,
+                        "border_width": 0, "align": "top_left",
+                        "z_index": 1, "timeout": ELEMENT_TIMEOUT})
+    return els
+
+
+def strip_frame(segs, marks, total, offset):
+    """One static pill with the icons and numbers scrolling through it.
+
+    This is the shape that reads best on the bar: the pill holds still, and what
+    moves is the content and the colour. Both are functions of the SAME offset,
+    which is the whole point -- the device path has to guess where the firmware
+    has scrolled to from a clock, and any drift shows as the gradient leading or
+    trailing the words it is supposed to be colouring. Here there is nothing to
+    drift: the colour at a frame and the words at that frame were computed from
+    one number.
+    """
+    px = -offset                      # banner coordinate at the screen's left edge
+    colors = window_colors(marks, total, px)
+    els = [{"id": "pill", "type": "rectangle",
+            "x": -PILL_BLEED, "y": -PILL_BLEED,
+            "width": W + 2 * PILL_BLEED, "height": PILL_H + 2 * PILL_BLEED,
+            "radius": (PILL_H + 2 * PILL_BLEED) // 2,
+            "fill": "gradient_h", "fill_colors": colors,
+            "border_width": BORDER_W, "border_color": rim(colors[0]),
+            "align": "top_left", "z_index": 0, "timeout": ELEMENT_TIMEOUT}]
+    els += edge_lines(colors)
+    for i, seg in enumerate(segs):
+        els.append({"id": f"i{i}", "type": "image", "path": f"{seg['key']}.png",
+                    "x": seg["icon_x"] + offset, "y": (H - ICON) // 2,
+                    "align": "top_left", "z_index": 5,
+                    "timeout": ELEMENT_TIMEOUT})
+        els.append({"id": f"n{i}", "type": "text", "text": seg["text"],
+                    "font": FONT, "color": NUMBER,
+                    "x": seg["text_x"] + offset, "y": H // 2, "align": "mid_left",
+                    "z_index": 6, "timeout": ELEMENT_TIMEOUT})
+    return els
 
 
 def device_pill(colors):
@@ -1210,13 +1297,17 @@ def capture_frames(args, stats):
     One frame per pixel of travel, and nothing here knows about frame rate.
     """
     segs, width = layout(counts_from(stats))
+    marks = [(seg["pill_x"], seg["key"]) for seg in segs]
     total = W + width
-    print(f"recording {total} frames of {width}px banner from the device")
+    print(f"recording {total} frames of {width}px banner from the device "
+          f"({args.layout} layout)")
 
     frames, retaken = [], 0
     for i in range(total):
         offset = W - i
-        draw(args.host, frame(segs, offset, i * SWEEP_PER_PX))
+        draw(args.host, strip_frame(segs, marks, width, offset)
+             if args.layout == "strip"
+             else frame(segs, offset, i * SWEEP_PER_PX))
         # ponytail: a draw returns as soon as the bar has ACCEPTED the elements,
         # not once it has rendered them, so reading the framebuffer straight
         # after can catch a frame with the pill moved and the number not yet --
@@ -1632,15 +1723,43 @@ def self_check():
                                      "apple_music", "fans"], marks
     assert total == sum(text_width(f"{LABELS[k]} {v:,}") + text_width(SEPARATOR)
                         for k, v in counts_from(social)), total
-    # the middle of a service is its own pure brand colour
-    for at, key in marks:
-        mid = at + BLEND_PX + 1
-        end = total if key == marks[-1][1] else marks[[k for _, k in marks].index(key) + 1][0]
-        if end - mid > BLEND_PX:
+    # Every service must reach its OWN brand colour somewhere in its tile. The
+    # previous version of this check skipped any tile with no room for a pure
+    # zone -- which, with a flat 34px blend against 57px tiles, was every tile,
+    # so it asserted nothing at all while the strip rendered as mud. Assert the
+    # pure zone EXISTS, then assert the colour in it.
+    def pure_zone_holds(marks_, total_):
+        blend = blend_px(marks_, total_)
+        for i, (at, key) in enumerate(marks_):
+            end = marks_[i + 1][0] if i + 1 < len(marks_) else total_
+            assert end - at > 2 * blend, (
+                f"{key}: a {end - at}px tile cannot hold two {blend}px blends")
+            mid = (at + end) // 2
             # pure brand hue through the middle -- the brightness wave rides on
             # top of it, so compare against the same colour at the same value
-            assert color_at(marks, total, mid) == mix(
-                pill_color(key), pill_color(key), 0.0, brightness_at(mid, total)), key
+            assert color_at(marks_, total_, mid) == mix(
+                pill_color(key), pill_color(key), 0.0, brightness_at(mid, total_)), key
+    pure_zone_holds(marks, total)
+
+    def centred_service_owns_the_pill(marks_, total_):
+        """Both gradient stops must be the brand colour of a centred tile."""
+        half = grad_half(marks_, total_)
+        for i, (at, key) in enumerate(marks_):
+            end = marks_[i + 1][0] if i + 1 < len(marks_) else total_
+            mid = (at + end) / 2.0
+            for stop in (mid - half, mid + half):
+                want = mix(pill_color(key), pill_color(key), 0.0,
+                           brightness_at(stop, total_))
+                assert color_at(marks_, total_, stop) == want, (
+                    f"{key}: stop at {stop - mid:+.0f} from centre is not its "
+                    f"own colour, so a centred service reads as a blend")
+    centred_service_owns_the_pill(marks, total)
+    # and again for the icon layout, whose tiles are less than half as wide as
+    # the spelled-out text ones -- the case the flat constant got wrong
+    icon_segs, icon_w = layout(counts_from(social))
+    icon_marks = [(g["pill_x"], g["key"]) for g in icon_segs]
+    pure_zone_holds(icon_marks, icon_w)
+    centred_service_owns_the_pill(icon_marks, icon_w)
 
     # the brightness wave: smooth, bounded, and a full cycle every PULSE_PX
     per = pulse_period(total)
@@ -1716,18 +1835,42 @@ def self_check():
     assert els[1]["width"] == TEXT_W and els[1]["x"] == TEXT_X
     assert TEXT_X + TEXT_W <= W, "the label window must fit inside the display"
     recolour = device_pill(["#FF5500FF", "#1ED760FF"])
-    assert [e["id"] for e in recolour] == ["pill", "edge0", "edge1"], \
+    assert recolour[0]["id"] == "pill" and len(recolour) == 1 + 2 * EDGE_H
+    assert not any(e["type"] == "text" for e in recolour), \
         "a recolour must never carry the text element, or the scroll restarts"
     assert all(e["type"] == "rectangle" for e in recolour)
-    # the hairlines hug the very top and bottom row, full width, and carry the
-    # same travelling colours as the pill they sit on
-    top, bot = recolour[1], recolour[2]
-    assert (top["y"], top["height"]) == (0, EDGE_H), top
-    assert bot["y"] + bot["height"] == H, bot
-    assert top["width"] == bot["width"] == W, "hairlines must span the display"
-    assert top["radius"] == bot["radius"] == 0, "a hairline is not a pill"
-    assert top["fill_colors"] == bot["fill_colors"] == recolour[0]["fill_colors"]
-    assert top["z_index"] > recolour[0]["z_index"], "must sit above the pill's rim"
+    # One hairline per ROW, each inset to where the pill's own silhouette starts
+    # on that row. A full-width hairline lights the corner pixels the pill leaves
+    # dark, which is what turned the rounded ends into notched ones.
+    rows = {e["y"]: e for e in recolour[1:]}
+    assert sorted(rows) == sorted(list(range(EDGE_H)) + [H - 1 - i for i in range(EDGE_H)])
+    for i, inset in enumerate(EDGE_INSET[:EDGE_H]):
+        for y in (i, H - 1 - i):
+            e = rows[y]
+            assert e["height"] == 1, e
+            assert e["x"] == inset and e["width"] == W - 2 * inset, e
+            assert e["radius"] == 0, "a hairline is not a pill"
+            assert e["fill_colors"] == recolour[0]["fill_colors"]
+            assert e["z_index"] > recolour[0]["z_index"], "above the pill's rim"
+    assert EDGE_INSET[0] > EDGE_INSET[-1], \
+        "the outermost row is the one the pill's curve cuts back furthest"
+
+    # the static-pill layout: the pill holds still at every offset, and the
+    # colour is a function of the same offset as the words, never of a clock
+    segs2, width2 = layout(counts_from(dict(stats, fans=1726)))
+    marks2 = [(g["pill_x"], g["key"]) for g in segs2]
+    a = strip_frame(segs2, marks2, width2, 0)
+    b = strip_frame(segs2, marks2, width2, -50)
+    pa = [e for e in a if e["id"] == "pill"][0]
+    pb = [e for e in b if e["id"] == "pill"][0]
+    assert (pa["x"], pa["y"], pa["width"]) == (pb["x"], pb["y"], pb["width"]), \
+        "the pill must not move between frames"
+    assert pa["fill_colors"] != pb["fill_colors"], "but its colour must"
+    ia = [e for e in a if e["id"] == "i0"][0]
+    ib = [e for e in b if e["id"] == "i0"][0]
+    assert ib["x"] == ia["x"] - 50, "the content is what scrolls"
+    assert pb["fill_colors"] == window_colors(marks2, width2, 50), \
+        "the gradient must be sampled at the same offset the words moved by"
     # a recolour is one element where a host frame is fifteen, which is the whole
     # reason 60 is reachable here and 13 was the ceiling there
     host_frame = frame(layout(counts_from(social))[0], 0, 0.0)
@@ -1892,6 +2035,11 @@ def parse_args(argv=None):
                         "(set equal to --bright for no wave)")
     p.add_argument("--bright", type=float, default=DIM_CEILING,
                    help="brightness at the crest of the wave, 0-1")
+    p.add_argument("--layout", choices=("strip", "banner"), default="strip",
+                   help="strip: one pill that holds still while the icons, "
+                        "numbers and colour scroll through it. banner: a "
+                        "separate brand pill per service, all scrolling "
+                        "together (default: strip)")
     p.add_argument("--render", choices=("anim", "device", "host"), default="anim",
                    help="anim: record the banner to a .anim the firmware plays "
                         "(logos AND 60 fps, no traffic once uploaded). "

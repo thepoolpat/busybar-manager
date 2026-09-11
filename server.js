@@ -9,6 +9,7 @@
  */
 const http = require("http");
 const https = require("https");
+const dns = require("dns");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -1719,22 +1720,67 @@ function handleUpgrade(req, socket, head) {
 
 /* ---------------------------- bar reachability ----------------------------- */
 
+// The bar's mDNS name (Bonjour/avahi) stays fixed even as its DHCP-assigned
+// IP drifts across networks or USB vs. WiFi. Used only to self-heal
+// config.barHost below — never as the request host itself, since Node's mDNS
+// resolution is slow (multi-second multicast round trip) on every lookup.
+const BAR_MDNS_HOST = "busybar.local";
+
+// The reachability probe deliberately is NOT /api/version. Measured 2026-09-11
+// against the same bar on both of its addresses:
+//
+//                          /api/version   /api/storage/status   draw
+//   10.0.4.20  (USB)           200               200            200
+//   192.168.1.7 (WiFi)         200               403            403
+//
+// /api/version answers on an address that refuses every other call, so probing
+// it made barReachable read true while every app looped on 403, and worse, it
+// let the mDNS self-heal below ADOPT the WiFi address and persist it -- so a
+// hand-set barHost did not survive a USB blip. Probe something that needs the
+// same access an app needs. storage/status is the cheapest such call: read
+// only, no display side effects, and a few dozen bytes.
+const BAR_PROBE_PATH = "/api/storage/status";
+
+async function probeBar(origin, path) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 3000);
+  try {
+    const resp = await fetch(`${origin}${path}`, { signal: controller.signal, headers: barHeaders({}) });
+    return resp.ok;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 let barReachable = false;
 async function checkBarReachable() {
   try {
-    const up = barUpstream("/api/version");
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 3000);
-    let ok = false;
-    try {
-      const resp = await fetch(`${up.origin}${up.path}`, {
-        signal: controller.signal,
-        headers: barHeaders({}),
+    const up = barUpstream(BAR_PROBE_PATH);
+    let ok = await probeBar(up.origin, up.path);
+
+    // barHost stopped answering. Before flagging it disconnected, ask mDNS
+    // where the bar is now (it may have moved WiFi networks, or dropped to
+    // USB-only) and adopt whichever advertised address actually responds.
+    if (!ok && !cloudMode()) {
+      const t = parseHostPort(config.barHost);
+      const candidates = await new Promise((resolve) => {
+        dns.lookup(BAR_MDNS_HOST, { all: true }, (err, addrs) => resolve(err ? [] : addrs));
       });
-      ok = resp.ok;
-    } finally {
-      clearTimeout(t);
+      for (const c of candidates) {
+        if (c.address === t.hostname) continue;
+        const origin = `http://${c.address}:${t.port}`;
+        if (await probeBar(origin, up.path)) {
+          log(`bar address changed: barHost ${config.barHost} -> ${c.address} (via ${BAR_MDNS_HOST})`);
+          config.barHost = c.address;
+          persist();
+          ok = true;
+          break;
+        }
+      }
     }
+
     if (ok !== barReachable) scheduleStateBroadcast();
     barReachable = ok;
   } catch (_) {
