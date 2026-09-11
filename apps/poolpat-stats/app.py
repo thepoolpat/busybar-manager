@@ -809,24 +809,33 @@ SCROLL_START_MS = 600
 SCROLL_REPEAT_MS = 1500
 TEXT_X, TEXT_W = 4, 64                   # the label window, inset inside the pill
 
-# The pill is drawn one pixel larger than the display on every side, so its 1px
-# border falls exactly on the pixels that were black before -- the display edge
-# becomes the outline instead of a gap. The border colour is the gradient's own
-# negative, which is what makes it read as an edge at every point of the cycle:
-# a border sharing the fill's hue disappears into it as the colour travels.
-PILL_BLEED = 1
+# The pill is INSET one pixel from the display on every side, so the whole of
+# its 1px border is on screen: margin, border, fill, border, margin, on both
+# axes. It used to be drawn one pixel LARGER than the display instead, which
+# put the top and bottom runs of the border off the panel and left the rim
+# visible only on the rounded left and right ends -- where it read as the two
+# sides blinking as the gradient travelled past, rather than as an outline.
+# Zero, and the arithmetic is why. The panel is 16 rows and the glyph box is 12.
+# A 1px outer margin plus a 1px border on each side leaves exactly 12 for the
+# label, so it fits with NO clearance and touches the border it sits in -- which
+# is what "it bleeds on top" looks like. With the border on the panel's own edge
+# the interior is 14 rows, and a 12-row label centred in it clears the border by
+# one pixel top and bottom. That one pixel is the margin worth having: an inner
+# one you can see against the outline, not an outer one against black.
+PILL_MARGIN = 0
 BORDER_W = 1
+STRIP_X = STRIP_Y = PILL_MARGIN
+STRIP_W = W - 2 * PILL_MARGIN
+STRIP_H = H - 2 * PILL_MARGIN
+STRIP_R = STRIP_H // 2
+# The label's baseline. Not H // 2: the font's mid_left anchor sits half a pixel
+# above the centre of the glyph box, so anchoring at the pill's own centre put
+# the comma's tail on row 14 -- ON the bottom border, punching a white hole in
+# the outline once the pill shrank to fit its border on screen. Measured: glyphs
+# occupy 12 rows, the pill's interior is 12 rows, and one pixel of correction
+# lines them up exactly.
+TEXT_Y = STRIP_Y + STRIP_H // 2 - 1
 
-# A 1px hairline along the very top and the very bottom, carrying the same
-# gradient as the pill. They sit above the pill's rim, so the display's outer
-# edge shows the travelling colour itself rather than the rim's darker step --
-# the rim then only outlines the rounded ends, where a pill needs an edge and
-# a straight line cannot give it one.
-# Two pixels, not one. The pill's rounded ends leave its four corners unlit, and
-# a 1px hairline only covered the outermost of the two dark rows at each end --
-# measured on the framebuffer, rows 0/1 and 14/15 had black at x=0 and x=71.
-# 2px covers both, so the banner reaches all four corners and no pixel is wasted.
-EDGE_H = 2
 # Pill recolours per second. The firmware scrolls the text at panel rate on its
 # own; this is only how often the colour under it is refreshed, and at 60 px/s a
 # 60 Hz recolour moves the gradient exactly one pixel per update -- in step with
@@ -1007,15 +1016,22 @@ def rim(color):
     return "#%02X%02X%02XFF" % (round(nr * 255), round(ng * 255), round(nb * 255))
 
 
-def device_frame(text, colors):
+def pill_parts(colors):
+    """The static background every path shares: the pill, its hairlines and its
+    softened corners. One definition, so the three render paths cannot end up
+    with three slightly different pills."""
     return [
         {"id": "pill", "type": "rectangle",
-         "x": -PILL_BLEED, "y": -PILL_BLEED,
-         "width": W + 2 * PILL_BLEED, "height": PILL_H + 2 * PILL_BLEED,
-         "radius": (PILL_H + 2 * PILL_BLEED) // 2,
+         "x": STRIP_X, "y": STRIP_Y,
+         "width": STRIP_W, "height": STRIP_H, "radius": STRIP_R,
          "fill": "gradient_h", "fill_colors": colors,
          "border_width": BORDER_W, "border_color": rim(colors[0]),
          "align": "top_left", "z_index": 0, "timeout": ELEMENT_TIMEOUT},
+    ]
+
+
+def device_frame(text, colors):
+    return pill_parts(colors) + [
         {"id": "txt", "type": "text", "text": text, "font": FONT, "color": NUMBER,
          "x": TEXT_X, "y": H // 2, "align": "mid_left", "width": TEXT_W,
          "scroll_rate": SCROLL_PPM, "scroll_start_delay": SCROLL_START_MS,
@@ -1024,32 +1040,13 @@ def device_frame(text, colors):
     ]
 
 
-# How far in from each side the pill's own silhouette starts, per row, working
-# inwards from the panel edge. MEASURED on the device by drawing the pill alone
-# and reading back the first lit pixel of each row: row 0 starts at x=2, row 1
-# at x=1, row 2 at x=0. Not derived from the radius, because PILL_BLEED and the
-# firmware's own antialiasing both move it.
-EDGE_INSET = (2, 1)
-
-
-def edge_lines(colors):
-    """The top and bottom hairlines, in the gradient's own colours.
-
-    One rectangle per ROW rather than one EDGE_H-tall block per edge. A square
-    ended hairline lights the corner pixels the pill deliberately leaves dark,
-    which turns the pill's rounded end into a notched rectangle -- four lit
-    pixels in each corner that belong to nothing.
-    """
-    els = []
-    for i, inset in enumerate(EDGE_INSET[:EDGE_H]):
-        for edge, y in ((0, i), (1, H - 1 - i)):
-            els.append({"id": f"edge{edge}{i}", "type": "rectangle",
-                        "x": inset, "y": y,
-                        "width": W - 2 * inset, "height": 1, "radius": 0,
-                        "fill": "gradient_h", "fill_colors": colors,
-                        "border_width": 0, "align": "top_left",
-                        "z_index": 1, "timeout": ELEMENT_TIMEOUT})
-    return els
+# No hand-rolled corner softening here any more, and that is the point of the
+# inset. While the pill was drawn LARGER than the display its corner arc ran off
+# the panel, so the visible corner was a bare stair-step and had to be filled in
+# by hand at a measured coverage. Inset by one pixel the whole arc is on screen
+# and the firmware antialiases it itself -- measured down the corner: 0x15,
+# 0x4B, 0x79 against a 0x78 border, a smoother ramp than the hand-tuned one.
+# The geometry fix deleted the workaround.
 
 
 def strip_frame(segs, marks, total, offset):
@@ -1065,14 +1062,7 @@ def strip_frame(segs, marks, total, offset):
     """
     px = -offset                      # banner coordinate at the screen's left edge
     colors = window_colors(marks, total, px)
-    els = [{"id": "pill", "type": "rectangle",
-            "x": -PILL_BLEED, "y": -PILL_BLEED,
-            "width": W + 2 * PILL_BLEED, "height": PILL_H + 2 * PILL_BLEED,
-            "radius": (PILL_H + 2 * PILL_BLEED) // 2,
-            "fill": "gradient_h", "fill_colors": colors,
-            "border_width": BORDER_W, "border_color": rim(colors[0]),
-            "align": "top_left", "z_index": 0, "timeout": ELEMENT_TIMEOUT}]
-    els += edge_lines(colors)
+    els = pill_parts(colors)
     for i, seg in enumerate(segs):
         els.append({"id": f"i{i}", "type": "image", "path": f"{seg['key']}.png",
                     "x": seg["icon_x"] + offset, "y": (H - ICON) // 2,
@@ -1080,19 +1070,9 @@ def strip_frame(segs, marks, total, offset):
                     "timeout": ELEMENT_TIMEOUT})
         els.append({"id": f"n{i}", "type": "text", "text": seg["text"],
                     "font": FONT, "color": NUMBER,
-                    "x": seg["text_x"] + offset, "y": H // 2, "align": "mid_left",
+                    "x": seg["text_x"] + offset, "y": TEXT_Y, "align": "mid_left",
                     "z_index": 6, "timeout": ELEMENT_TIMEOUT})
     return els
-
-
-def device_pill(colors):
-    """The pill and its hairlines, by id -- never the mid-scroll text element.
-
-    ponytail: three elements, not one, and still nowhere near a frame. What
-    matters is that the text element is absent, because resending it is what
-    would restart the firmware's scroll.
-    """
-    return [device_frame("", colors)[0]] + edge_lines(colors)
 
 
 # --- animation build ----------------------------------------------------------
@@ -1402,7 +1382,7 @@ def run_device(args, stats):
           f"wave travels only on --render anim, where a frame is recorded "
           f"rather than drawn over the firmware's scroll")
     colors = window_colors(marks, total, 0.0, args.dim, args.bright)
-    draw(args.host, device_frame(text, colors) + edge_lines(colors))
+    draw(args.host, device_frame(text, colors))
     next_fetch = started + args.refresh
     blocked = False
     ticks, reported, beat, due = 0, started, 1.0 / RECOLOUR_HZ, started
@@ -1433,7 +1413,7 @@ def run_device(args, stats):
                     # a full redraw, because recovering from a 409 means the
                     # text element went with the screen
                     status, body = draw(args.host,
-                                        device_frame(text, colors) + edge_lines(colors))
+                                        device_frame(text, colors))
                 except urllib.error.URLError as e:
                     print(f"skipped a redraw ({e.reason})")
                     status, body = 200, ""
@@ -1462,7 +1442,7 @@ def run_device(args, stats):
                         text, marks, total = strip(counts_from(stats))
                         started = due = time.monotonic()   # the strip changed length
                         colors = window_colors(marks, total, 0.0, args.dim, args.bright)
-                        draw(args.host, device_frame(text, colors) + edge_lines(colors))
+                        draw(args.host, device_frame(text, colors))
                         print(f"updated: {total}px")
             ticks += 1
             if not calibrated:
@@ -1814,9 +1794,16 @@ def self_check():
     assert rim("#FF5500FF") != rim("#1ED760FF"), "the rim must follow the fill"
 
     # the pill overhangs the display so its border lands on the edge pixels
-    pill = device_frame("x", ["#FF5500FF", "#1ED760FF"])[0]
-    assert pill["x"] == -PILL_BLEED and pill["y"] == -PILL_BLEED
-    assert pill["width"] == W + 2 and pill["height"] == H + 2, pill
+    pill = pill_parts(["#FF5500FF", "#1ED760FF"])[0]
+    assert (pill["x"], pill["y"]) == (PILL_MARGIN, PILL_MARGIN)
+    assert pill["width"] == W - 2 * PILL_MARGIN and pill["height"] == H - 2 * PILL_MARGIN
+    # every run of the border must be ON the panel, which is the whole point:
+    # drawn larger than the display, its top and bottom fell off and the rim
+    # showed only on the rounded ends, reading as the two sides blinking
+    assert pill["x"] >= BORDER_W - 1 and pill["y"] >= BORDER_W - 1
+    assert pill["x"] + pill["width"] <= W and pill["y"] + pill["height"] <= H
+    # and the label must clear both border rows, or a descender holes the outline
+    assert STRIP_Y + BORDER_W <= TEXT_Y < STRIP_Y + STRIP_H - BORDER_W, TEXT_Y
     assert pill["radius"] * 2 == pill["height"], "still a pill, not a rounded box"
     assert pill["border_width"] == BORDER_W == 1
     assert pill["border_color"] == rim("#FF5500FF")
@@ -1843,29 +1830,17 @@ def self_check():
     # the firmware does the scrolling: the text element carries a rate, the
     # recolour carries only the pill so a mid-scroll label is never disturbed
     els = device_frame(text, ["#5B4FE9FF", "#FF5500FF"])
-    assert len(els) == 2 and els[1]["scroll_rate"] == SCROLL_PPM
-    assert els[1]["width"] == TEXT_W and els[1]["x"] == TEXT_X
+    label = els[-1]
+    assert label["type"] == "text" and label["scroll_rate"] == SCROLL_PPM
+    assert label["width"] == TEXT_W and label["x"] == TEXT_X
+    assert els[:-1] == pill_parts(["#5B4FE9FF", "#FF5500FF"]), \
+        "the label sits on exactly the shared background, nothing else"
     assert TEXT_X + TEXT_W <= W, "the label window must fit inside the display"
-    recolour = device_pill(["#FF5500FF", "#1ED760FF"])
-    assert recolour[0]["id"] == "pill" and len(recolour) == 1 + 2 * EDGE_H
+    recolour = pill_parts(["#FF5500FF", "#1ED760FF"])
+    assert recolour[0]["id"] == "pill"
+    assert len(recolour) == 1, "the background is the pill; the firmware draws its own corners"
     assert not any(e["type"] == "text" for e in recolour), \
-        "device_pill is the pill alone; the text element belongs to a full redraw"
-    assert all(e["type"] == "rectangle" for e in recolour)
-    # One hairline per ROW, each inset to where the pill's own silhouette starts
-    # on that row. A full-width hairline lights the corner pixels the pill leaves
-    # dark, which is what turned the rounded ends into notched ones.
-    rows = {e["y"]: e for e in recolour[1:]}
-    assert sorted(rows) == sorted(list(range(EDGE_H)) + [H - 1 - i for i in range(EDGE_H)])
-    for i, inset in enumerate(EDGE_INSET[:EDGE_H]):
-        for y in (i, H - 1 - i):
-            e = rows[y]
-            assert e["height"] == 1, e
-            assert e["x"] == inset and e["width"] == W - 2 * inset, e
-            assert e["radius"] == 0, "a hairline is not a pill"
-            assert e["fill_colors"] == recolour[0]["fill_colors"]
-            assert e["z_index"] > recolour[0]["z_index"], "above the pill's rim"
-    assert EDGE_INSET[0] > EDGE_INSET[-1], \
-        "the outermost row is the one the pill's curve cuts back furthest"
+        "pill_parts is the background alone; the label is added on top of it"
 
     # the static-pill layout: the pill holds still at every offset, and the
     # colour is a function of the same offset as the words, never of a clock
@@ -1883,11 +1858,14 @@ def self_check():
     assert ib["x"] == ia["x"] - 50, "the content is what scrolls"
     assert pb["fill_colors"] == window_colors(marks2, width2, 50), \
         "the gradient must be sampled at the same offset the words moved by"
-    # a recolour is one element where a host frame is fifteen, which is the whole
-    # reason 60 is reachable here and 13 was the ceiling there
-    host_frame = frame(layout(counts_from(social))[0], 0, 0.0)
-    assert len(device_pill(["#000000FF", "#000000FF"])) * 2 <= len(host_frame), \
-        "a recolour must stay well cheaper than a host frame"
+    # The old assertion here compared a recolour against a host frame, and there
+    # is no recolour any more. What is worth bounding now is the RECORDING cost:
+    # a draw is ~36ms plus ~3ms per element, and every frame of the strip pays
+    # it once, so an element added to strip_frame costs about a second and a
+    # half across a 435-frame pass. Cheap enough to soften four corners, not
+    # cheap enough to stop counting.
+    assert len(a) <= 40, f"{len(a)} elements per recorded frame is getting dear"
+    assert len(a) == len(pill_parts(["#000000FF", "#000000FF"])) + 2 * len(segs2)
 
     # the cadence latch: it must calibrate once and stay calibrated, however
     # often the profile counter is reset underneath it
