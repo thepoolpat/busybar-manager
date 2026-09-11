@@ -1119,23 +1119,80 @@ def anim_pack(frames, fps, duration):
     return bytes(header + section + body)
 
 
+def fps_list(text):
+    """--fps 60,25 -> [60, 25]. The header stores the rate in ONE BYTE, so
+    anything outside 1-255 would be silently truncated by struct.pack."""
+    rates = [int(part) for part in text.replace(" ", "").split(",") if part]
+    if not rates or any(not 1 <= r <= 255 for r in rates):
+        raise argparse.ArgumentTypeError(
+            "frame rates must be whole numbers 1-255, comma separated")
+    return rates
+
+
 def build_anim(args, stats):
-    """--build-anim: record the banner and leave the file on disk."""
-    blob = record_anim(args, stats)
-    with open(args.build_anim, "wb") as fh:
-        fh.write(blob)
-    print(f"wrote {args.build_anim}: {len(blob):,} bytes")
+    """--build-anim: record the banner and leave a file per --fps on disk."""
+    frames = capture_frames(args, stats)
+    for fps in args.fps:
+        blob = pack_pass(frames, fps, args.speed)
+        path = anim_path(args.build_anim, fps, len(args.fps) > 1)
+        with open(path, "wb") as fh:
+            fh.write(blob)
+        print(f"  wrote {path}")
     return 0
 
 
+def anim_path(base, fps, tag):
+    """banner.anim -> banner-25fps.anim, but only when there is more than one."""
+    if not tag:
+        return base
+    stem, ext = os.path.splitext(base)      # splitext, so a dot in a parent
+    return f"{stem}-{fps}fps{ext}"          # directory cannot eat the name
+
+
+def pack_pass(frames, fps, speed):
+    """One recording -> one .anim at one frame rate.
+
+    ponytail: the frames are rate-INDEPENDENT. Every pixel of the gradient is a
+    function of the scroll offset (SWEEP_PER_PX) and never of the wall clock, so
+    the same captured bytes are correct at any frame rate; only the header's fps
+    and the per-frame hold change. That is why a second rate costs no device time
+    and, more importantly, why 60 and 25 are a fair comparison -- they are the
+    same pixels, not two recordings with two sets of settle retakes in them.
+    """
+    # MEASURED, not assumed: a 25 fps / hold 2 file over 372 frames predicts a
+    # 29.76s loop if the player honours the header rate, or 12.4s if it ignores
+    # it and ticks at 60. Timed on the device by watching for the blank frame
+    # between passes: 29.76s. The fps byte is real, so a lower rate is a slower
+    # clock and not a dropped frame.
+    #
+    # The corollary is the ceiling: one pixel per display frame is as fast as a
+    # pass can go, so 25 fps cannot express a 30 px/s scroll at all -- hold 1 is
+    # 25 px/s and there is nothing between. That is reported, not rounded away.
+    duration = max(1, round(fps / max(1, speed)))
+    blob = anim_pack(frames, fps, duration)
+    achieved = fps / duration                  # px/s the hold actually produces
+    drift = achieved / speed - 1
+    raw_total = len(frames) * W * H * 3
+    print(f"  {fps} fps, hold {duration}: {achieved:.2f} px/s "
+          f"({'exact' if abs(drift) < 0.005 else f'{drift:+.1%} off --speed {speed}'}), "
+          f"{len(frames) * duration / fps:.1f}s per pass, "
+          f"{len(blob):,} bytes ({len(blob) / raw_total:.1%} of raw)")
+    return blob
+
+
 def record_anim(args, stats):
-    """Record the banner off the device one offset at a time, then pack it."""
+    """Record and pack at the first --fps: what the live paths play."""
+    return pack_pass(capture_frames(args, stats), args.fps[0], args.speed)
+
+
+def capture_frames(args, stats):
+    """Record the banner off the device one offset at a time.
+
+    One frame per pixel of travel, and nothing here knows about frame rate.
+    """
     segs, width = layout(counts_from(stats))
     total = W + width
-    duration = max(1, round(args.fps / max(1, args.speed)))
-    print(f"recording {total} frames of {width}px banner from the device "
-          f"({total * duration / args.fps:.1f}s per pass at {args.fps} fps, "
-          f"each frame held {duration})")
+    print(f"recording {total} frames of {width}px banner from the device")
 
     frames, retaken = [], 0
     for i in range(total):
@@ -1162,15 +1219,16 @@ def record_anim(args, stats):
     clear(args.host)
     if retaken:
         print(f"  {retaken} frames needed a re-read before they settled")
-
-    blob = anim_pack(frames, args.fps, duration)
-    raw_total = total * W * H * 3
-    print(f"packed {len(blob):,} bytes ({len(blob) / raw_total:.1%} of raw), "
-          f"{total} frames at {args.fps} fps")
-    return blob
+    return frames
 
 
 ANIM_ASSET = "banner.anim"
+
+
+def anim_asset(fps, tag):
+    """The name a pass is stored under on the bar. One name when there is one
+    rate, so the common case stays `banner.anim` and nothing has to migrate."""
+    return anim_path(ANIM_ASSET, fps, tag)
 
 
 def run_anim(args, stats):
@@ -1185,15 +1243,23 @@ def run_anim(args, stats):
     try:
         while True:
             if counts_from(stats) != shown:
-                blob = record_anim(args, stats)
-                upload(args.host, ANIM_ASSET, blob)
+                # One trip to the device, then a pass per --fps off the same
+                # frames. The first rate is the one that plays; the rest sit on
+                # the bar so switching between them is a draw, not a re-record.
+                frames = capture_frames(args, stats)
+                tag = len(args.fps) > 1
+                for fps in args.fps:
+                    upload(args.host, anim_asset(fps, tag),
+                           pack_pass(frames, fps, args.speed))
+                playing = anim_asset(args.fps[0], tag)
                 draw(args.host, [{"id": "anim", "type": "animation",
-                                  "path": ANIM_ASSET, "loop": True,
+                                  "path": playing, "loop": True,
                                   "x": 0, "y": 0, "align": "top_left",
                                   "z_index": 0, "timeout": 0}])
                 shown = counts_from(stats)
-                print(f"{len(blob):,} bytes on the bar, playing at {args.fps} fps "
-                      f"- this process is now idle")
+                spare = [anim_asset(f, tag) for f in args.fps[1:]]
+                print(f"playing {playing} - this process is now idle"
+                      + (f"; also on the bar: {', '.join(spare)}" if spare else ""))
 
             time.sleep(args.refresh)
             if stats["as_of"] == "pinned":
@@ -1692,6 +1758,45 @@ def self_check():
     payload = blob[offs + 4:offs + 4 + elen]
     assert (rle_decompress(payload) if enc == ANIM_RLE else payload) == two[0]
 
+    # A second frame rate has to be a REPACK, not a second recording: the same
+    # pixels, with only the header rate and the per-frame hold different. If
+    # this ever fails then --fps 60,25 is quietly producing two different
+    # animations and any comparison between them is a lie.
+    def frame_payloads(blob):
+        (_fl, _w, _h, _fmt, rate, _long, _u, sect, _body,
+         _sec, count, _disp) = struct.unpack("<BBBBBHBIIIII", blob[8:ANIM_HEADER_LEN])
+        at, holds, out = ANIM_HEADER_LEN + sect, [], []
+        for _ in range(count):
+            enc_, hold, elen = struct.unpack("<BBH", blob[at:at + 4])
+            holds.append(hold)
+            out.append(blob[at + 4:at + 4 + elen])
+            at += 4 + elen
+        assert at == len(blob), "the frames chunk must account for every byte"
+        return rate, holds, out
+
+    r60, h60, p60 = frame_payloads(anim_pack(two, 60, 5))
+    r25, h25, p25 = frame_payloads(anim_pack(two, 25, 2))
+    assert (r60, r25) == (60, 25) and set(h60) == {5} and set(h25) == {2}
+    assert p60 == p25, "a rate change must not alter a single pixel"
+    # and the hold is what sets the scroll: 60/5 is exactly 12 px/s, 25/2 is
+    # 12.5, which is a real 4% faster and is printed rather than rounded away
+    assert 60 / 5 == 12.0 and 25 / 2 == 12.5
+
+    assert fps_list("60,25") == [60, 25] and fps_list(" 30 ") == [30]
+    assert fps_list("60,") == [60], "a trailing comma is intent, not an error"
+    for bad in ("", "0", "256", "60,0", "60,x"):
+        try:
+            fps_list(bad)
+        except (argparse.ArgumentTypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"fps_list accepted {bad!r}")
+    assert anim_path("banner.anim", 25, False) == "banner.anim"
+    assert anim_path("banner.anim", 25, True) == "banner-25fps.anim"
+    assert anim_path("/tmp/v1.2/banner", 25, True) == "/tmp/v1.2/banner-25fps"
+    assert parse_args([]).fps == [60], "one rate stays the default"
+    assert parse_args(["--fps", "60,25"]).fps == [60, 25]
+
     args = parse_args([])
     assert args.render == "anim", "the recorded animation is the default"
     assert pinned(args) is None, "no overrides means fetch"
@@ -1732,8 +1837,10 @@ def parse_args(argv=None):
     p.add_argument("--build-anim", metavar="FILE",
                    help="record the banner off the device into a .anim file "
                         "the firmware can play with no host traffic at all")
-    p.add_argument("--fps", type=int, default=60,
-                   help="frames per second written into the .anim header")
+    p.add_argument("--fps", type=fps_list, default=[60],
+                   help="frame rate(s) for the .anim header, comma separated; "
+                        "60,25 records once and packs both, and the first is "
+                        "the one that plays (default: 60)")
     p.add_argument("--dim", type=float, default=DIM_FLOOR,
                    help="brightness at the trough of the wave, 0-1 "
                         "(set equal to --bright for no wave)")
@@ -1747,8 +1854,10 @@ def parse_args(argv=None):
                         "host: this process pushes frames (logos, ~12 fps)")
     p.add_argument("--profile", action="store_true",
                    help="print the achieved draw rate every 5s")
-    p.add_argument("--speed", type=int, default=12,
-                   help="scroll speed in pixels per second (default: 10)")
+    p.add_argument("--speed", type=int, default=SCROLL_PPM // 60,
+                   help=f"scroll speed in pixels per second, the same rate the "
+                        f"firmware scrolls at in --render device so the paths "
+                        f"match (default: {SCROLL_PPM // 60})")
     p.add_argument("--shot", metavar="PNG", help="save the current display and exit")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--test", action="store_true", help="self-check, no device needed")
