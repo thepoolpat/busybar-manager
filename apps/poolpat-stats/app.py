@@ -1398,36 +1398,44 @@ def run_device(args, stats):
     started = time.monotonic()
     if not 0.0 <= args.dim <= args.bright <= 1.0:
         raise SystemExit("--dim must be between 0 and --bright, and --bright at most 1")
-    print(f"brightness wave {args.dim:.2f}-{args.bright:.2f} every {PULSE_PX}px")
-    first = window_colors(marks, total, 0.0, args.dim, args.bright)
-    draw(args.host, device_frame(text, first) + edge_lines(first))
+    print(f"still gradient, brightness {args.dim:.2f}-{args.bright:.2f} - the "
+          f"wave travels only on --render anim, where a frame is recorded "
+          f"rather than drawn over the firmware's scroll")
+    colors = window_colors(marks, total, 0.0, args.dim, args.bright)
+    draw(args.host, device_frame(text, colors) + edge_lines(colors))
     next_fetch = started + args.refresh
     blocked = False
     ticks, reported, beat, due = 0, started, 1.0 / RECOLOUR_HZ, started
-    last_colors, sent, sent_skipped = None, 0, 0
+    sent, sent_skipped = 1, 0            # the first draw above already went
     calibrating, calibrated, calib_from = 0, False, started
     try:
         while True:
             now = time.monotonic()
-            # Where the firmware has scrolled to by now, from its own rate.
-            px = (now - started - SCROLL_START_MS / 1000.0) * (SCROLL_PPM / 60.0)
-            px = max(0.0, px)
-            # Quantise to whole pixels of travel, then send only on change.
-            # The gradient is a function of position, so at 30 px/s there are
-            # only 30 distinct colours per second no matter how often this loop
-            # wakes: ticking faster than that produces duplicate draws, not a
-            # smoother gradient. Waking at 60 and sending ~30 is what keeps the
-            # colour on the very next pixel without wasting a POST on a repeat.
-            colors = window_colors(marks, total, float(int(px)), args.dim, args.bright)
-            if colors == last_colors:
+            # THE COLOUR DOES NOT TRAVEL ON THIS PATH, and it cannot.
+            #
+            # This loop used to recompute the gradient from the clock and send
+            # it ~30 times a second. Measured on the device: ANY draw to the
+            # owning application restarts the firmware's text scroll, not just
+            # one carrying the text element. With no draws the glyphs move 3044
+            # pixels in three seconds; with the recolour running they move ZERO,
+            # because the 600ms scroll_start_delay never gets to elapse. Drawing
+            # the pill under a second application_name is not a way out either
+            # -- that is a 409, the screen has one owner.
+            #
+            # So on this path you get scrolling words on a still gradient, which
+            # is what it now does. --render anim is the path that gets both, by
+            # recording the frames instead of racing the firmware for the wire.
+            if not blocked and sent:
                 sent_skipped += 1
                 status, body = 200, ""
             else:
-                last_colors = colors
                 try:
-                    status, body = draw(args.host, device_pill(colors))
+                    # a full redraw, because recovering from a 409 means the
+                    # text element went with the screen
+                    status, body = draw(args.host,
+                                        device_frame(text, colors) + edge_lines(colors))
                 except urllib.error.URLError as e:
-                    print(f"skipped a recolour ({e.reason})")
+                    print(f"skipped a redraw ({e.reason})")
                     status, body = 200, ""
                 else:
                     sent += 1
@@ -1438,7 +1446,6 @@ def run_device(args, stats):
                 if not blocked:
                     print(f"{status} {body.strip()} - holding until the screen frees up")
                     blocked = True
-                last_colors = None      # force a resend once the screen is free
             elif blocked:
                 print("screen free again")
                 blocked = False
@@ -1454,7 +1461,8 @@ def run_device(args, stats):
                         stats = fresh
                         text, marks, total = strip(counts_from(stats))
                         started = due = time.monotonic()   # the strip changed length
-                        draw(args.host, device_frame(text, colors))
+                        colors = window_colors(marks, total, 0.0, args.dim, args.bright)
+                        draw(args.host, device_frame(text, colors) + edge_lines(colors))
                         print(f"updated: {total}px")
             ticks += 1
             if not calibrated:
@@ -1524,6 +1532,7 @@ def run(args):
         raise SystemExit("--speed must be at least 1 px/s; use --shot for a still")
 
     segs, width = layout(counts_from(stats))
+    marks = [(seg["pill_x"], seg["key"]) for seg in segs]
     print(f"{width}px banner at {args.speed} px/s "
           f"({width / args.speed:.0f}s per pass) - ctrl-c to stop")
 
@@ -1556,7 +1565,10 @@ def run(args):
                 # Same integer pixel count drives both, so the colour advances
                 # exactly when the banner does and never between steps.
                 phase = travelled * SWEEP_PER_PX
-                status, body = draw(args.host, frame(segs, offset, phase))
+                status, body = draw(
+                    args.host,
+                    strip_frame(segs, marks, width, offset)
+                    if args.layout == "strip" else frame(segs, offset, phase))
                 drawn += 1
             except urllib.error.URLError as e:
                 # ponytail: over wi-fi a dropped frame is normal, keep scrolling.
@@ -1837,7 +1849,7 @@ def self_check():
     recolour = device_pill(["#FF5500FF", "#1ED760FF"])
     assert recolour[0]["id"] == "pill" and len(recolour) == 1 + 2 * EDGE_H
     assert not any(e["type"] == "text" for e in recolour), \
-        "a recolour must never carry the text element, or the scroll restarts"
+        "device_pill is the pill alone; the text element belongs to a full redraw"
     assert all(e["type"] == "rectangle" for e in recolour)
     # One hairline per ROW, each inset to where the pill's own silhouette starts
     # on that row. A full-width hairline lights the corner pixels the pill leaves
@@ -2043,8 +2055,9 @@ def parse_args(argv=None):
     p.add_argument("--render", choices=("anim", "device", "host"), default="anim",
                    help="anim: record the banner to a .anim the firmware plays "
                         "(logos AND 60 fps, no traffic once uploaded). "
-                        "device: the firmware scrolls one text label (smooth, "
-                        "no logos, instant start). "
+                        "device: the firmware scrolls one text label, on a "
+                        "STILL gradient - a travelling one would restart the "
+                        "scroll on every draw. No logos, but instant start. "
                         "host: this process pushes frames (logos, ~12 fps)")
     p.add_argument("--profile", action="store_true",
                    help="print the achieved draw rate every 5s")
