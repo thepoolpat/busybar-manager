@@ -661,7 +661,7 @@ def apple_music_figure():
     return _APPLE_MUSIC[0]
 
 
-def fetch_stats(source):
+def fetch_stats(source, fans=None):
     """Whichever source is configured, as {sc, sp, am, fans, as_of}.
 
     Songstats publishes no Apple Music plays on any plan, so under that source
@@ -669,6 +669,13 @@ def fetch_stats(source):
     dropped -- the number is stale by design either way, and losing the tile
     loses a platform from the banner. If the portfolio is unreachable the tile
     goes rather than the whole banner.
+
+    `fans` is the same idea pointing the other way: the portfolio repo publishes
+    no all-platform follower total and there is no key-free way to read one, so
+    --fans fills a tile the live source cannot see WITHOUT pinning the play
+    counts too. It only ever fills a gap -- a source that reports its own
+    followers keeps them, so adding the Songstats key makes the flag moot
+    instead of making it lie.
     """
     if source == "songstats":
         key = songstats_key()
@@ -679,8 +686,11 @@ def fetch_stats(source):
                 '  security add-generic-password -s SONGSTATS_API_KEY -a "$USER" -w')
         counts = fetch_songstats(key)
         counts["am"] = apple_music_figure()
-        return counts
-    return fetch_portfolio()
+    else:
+        counts = fetch_portfolio()
+    if counts.get("fans") is None:
+        counts["fans"] = fans
+    return counts
 
 
 def counts_from(stats):
@@ -741,7 +751,7 @@ def claim(path=LOCK):
     return f
 
 
-def prepare(host, source, stats):
+def prepare(host, source, stats, fans=None):
     """Upload the icons and take the first reading, waiting for the bar.
 
     ponytail: this retries instead of raising because the manager reads any exit
@@ -756,7 +766,7 @@ def prepare(host, source, stats):
             clear(host)       # elements merge by id, so drop anything stale first
             for key, (grid, _, _) in BRAND.items():
                 upload(host, f"{key}.png", icon_png(grid, logo_color(key)))
-            return stats or fetch_stats(source)
+            return stats or fetch_stats(source, fans)
         except KeyboardInterrupt:
             raise
         except MisconfiguredError:
@@ -1159,6 +1169,15 @@ def pack_pass(frames, fps, speed):
     and, more importantly, why 60 and 25 are a fair comparison -- they are the
     same pixels, not two recordings with two sets of settle retakes in them.
     """
+    # What the header rate actually does, stated plainly because it is easy to
+    # get backwards: there is exactly ONE captured image per pixel of travel, so
+    # fps and duration only ever combine into fps/duration px/s. The panel holds
+    # a still image between pixel steps at every rate. Changing the header rate
+    # is therefore a SPEED change, not a smoothness change -- a 25 fps pass is
+    # not a coarser 60 fps pass, it is the same pictures shown for longer. Real
+    # frame-rate headroom would need more than one image per pixel, i.e. capture
+    # at sub-pixel offsets, which this does not do.
+    #
     # MEASURED, not assumed: a 25 fps / hold 2 file over 372 frames predicts a
     # 29.76s loop if the player honours the header rate, or 12.4s if it ignores
     # it and ticks at 60. Timed on the device by watching for the blank frame
@@ -1265,7 +1284,7 @@ def run_anim(args, stats):
             if stats["as_of"] == "pinned":
                 continue
             try:
-                fresh = fetch_stats(args.source)
+                fresh = fetch_stats(args.source, args.fans)
             except Exception as e:                      # noqa: BLE001
                 print(f"refresh failed, keeping the last numbers ({e})")
             else:
@@ -1336,7 +1355,7 @@ def run_device(args, stats):
             if stats["as_of"] != "pinned" and now >= next_fetch:
                 next_fetch = now + args.refresh
                 try:
-                    fresh = fetch_stats(args.source)
+                    fresh = fetch_stats(args.source, args.fans)
                 except Exception as e:                  # noqa: BLE001
                     print(f"refresh failed, keeping the last numbers ({e})")
                 else:
@@ -1392,7 +1411,7 @@ def run(args):
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
     try:
-        stats = prepare(args.host, args.source, pinned(args))
+        stats = prepare(args.host, args.source, pinned(args), args.fans)
     except KeyboardInterrupt:
         return 0
     print(f"{stats['as_of'] if stats['as_of'] == 'pinned' else args.source} "
@@ -1436,6 +1455,11 @@ def run(args):
         while True:
             try:
                 elapsed = time.monotonic() - started
+                # ponytail: one --speed serves all three paths, which keeps
+                # them from drifting apart, but it has a ceiling worth naming
+                # here -- this loop holds ~12.5 fps, so the shared 30 px/s lands
+                # as ~2.4px jumps where the two firmware paths step one pixel at
+                # a time. Pass --speed 12 if this path is ever the one on screen.
                 travelled = int(elapsed * args.speed)     # whole pixels only
                 offset = W - travelled % (W + width)
                 # Same integer pixel count drives both, so the colour advances
@@ -1464,7 +1488,7 @@ def run(args):
             if stats["as_of"] != "pinned" and time.monotonic() >= next_fetch:
                 next_fetch = time.monotonic() + args.refresh
                 try:
-                    fresh = fetch_stats(args.source)
+                    fresh = fetch_stats(args.source, args.fans)
                 except Exception as e:                  # noqa: BLE001 - any fetch fault
                     # Hold the last good numbers. A stats banner showing last
                     # week's total is right; one showing nothing is not.
@@ -1797,6 +1821,25 @@ def self_check():
     assert parse_args([]).fps == [60], "one rate stays the default"
     assert parse_args(["--fps", "60,25"]).fps == [60, 25]
 
+    # --fans must fill the tile no key-free source publishes WITHOUT pinning the
+    # play counts, and must never overwrite a source that reports its own. The
+    # first half is the bug: --fans used to need --sc and --sp beside it, so
+    # asking for the follower tile silently froze the three play counts too.
+    real = globals()["fetch_portfolio"]
+    globals()["fetch_portfolio"] = lambda *a, **k: {
+        "sc": 1, "sp": 2, "am": 3, "fans": None, "as_of": "stub"}
+    try:
+        assert fetch_stats("portfolio")["fans"] is None
+        overlaid = fetch_stats("portfolio", 1726)
+        assert overlaid["fans"] == 1726 and overlaid["sc"] == 1, overlaid
+        assert [k for k, _ in counts_from(overlaid)][-1] == "fans"
+        globals()["fetch_portfolio"] = lambda *a, **k: {
+            "sc": 1, "sp": 2, "am": 3, "fans": 99, "as_of": "stub"}
+        assert fetch_stats("portfolio", 1726)["fans"] == 99, "the source wins"
+    finally:
+        globals()["fetch_portfolio"] = real
+    assert pinned(parse_args(["--fans", "1726"])) is None, "--fans alone must not pin"
+
     args = parse_args([])
     assert args.render == "anim", "the recorded animation is the default"
     assert pinned(args) is None, "no overrides means fetch"
@@ -1833,7 +1876,10 @@ def parse_args(argv=None):
     p.add_argument("--sp", type=int, default=None, help="pin Spotify plays, skip fetching")
     p.add_argument("--am", type=int, default=None, help="pin Apple Music plays, skip fetching")
     p.add_argument("--fans", type=int, default=None,
-                   help="pin the all-platform follower total")
+                   help="the all-platform follower total, which no key-free "
+                        "source publishes; fills that tile without pinning the "
+                        "play counts, and is ignored once --source songstats "
+                        "can report followers itself")
     p.add_argument("--build-anim", metavar="FILE",
                    help="record the banner off the device into a .anim file "
                         "the firmware can play with no host traffic at all")
