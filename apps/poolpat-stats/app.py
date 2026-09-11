@@ -379,7 +379,7 @@ def layout(counts):
     """
     segs, x = [], 0
     for key, value in counts:
-        text = f"{value:,}"
+        text = group(value)
         icon_x = x + PILL_PAD
         text_x = icon_x + ICON + PAD
         pill_w = PILL_PAD + ICON + PAD + text_width(text) + PILL_PAD
@@ -828,13 +828,12 @@ STRIP_X = STRIP_Y = PILL_MARGIN
 STRIP_W = W - 2 * PILL_MARGIN
 STRIP_H = H - 2 * PILL_MARGIN
 STRIP_R = STRIP_H // 2
-# The label's baseline. Not H // 2: the font's mid_left anchor sits half a pixel
-# above the centre of the glyph box, so anchoring at the pill's own centre put
-# the comma's tail on row 14 -- ON the bottom border, punching a white hole in
-# the outline once the pill shrank to fit its border on screen. Measured: glyphs
-# occupy 12 rows, the pill's interior is 12 rows, and one pixel of correction
-# lines them up exactly.
-TEXT_Y = STRIP_Y + STRIP_H // 2 - 1
+# The label's baseline, and it is the pill's own centre again. It needed a one
+# pixel correction while the numbers carried commas, because the comma's tail
+# made the glyph box 12 rows against the digits' 10 and pushed it off centre.
+# group() uses a space now, so the box is 10 rows, it centres in the 14-row
+# interior on its own, and it clears the border by two rows top and bottom.
+TEXT_Y = STRIP_Y + STRIP_H // 2
 
 # Pill recolours per second. The firmware scrolls the text at panel rate on its
 # own; this is only how often the colour under it is refreshed, and at 60 px/s a
@@ -857,7 +856,7 @@ def strip(counts):
     """
     parts, marks, x = [], [], 0
     for key, value in counts:
-        text = f"{LABELS[key]} {value:,}"
+        text = f"{LABELS[key]} {group(value)}"
         marks.append((x, key))
         parts.append(text)
         x += text_width(text) + text_width(SEPARATOR)
@@ -1016,6 +1015,50 @@ def rim(color):
     return "#%02X%02X%02XFF" % (round(nr * 255), round(ng * 255), round(nb * 255))
 
 
+def group(value):
+    """1726 -> "1 726". A SPACE, not a comma.
+
+    The comma is the only glyph in this font with a descender: measured on the
+    device, "28,588" is 12 rows tall where "28588", "28.588" and "28 588" are
+    all 10. Those two extra rows are what pushed the label off centre inside the
+    pill and put a white hole through the bottom border. A period would cost
+    nothing either but reads as a decimal point on a number like this. A space
+    costs one pixel across a six-digit number and is a thousands separator in
+    its own right.
+    """
+    return f"{value:,}".replace(",", " ")
+
+
+# Where the pill's arc cuts in, per row, from the panel's top edge. MEASURED off
+# the device: rows 0-3 start at x=4,3,2,1 and rows 4-11 at x=0, mirrored below.
+ARC_INSET = (4, 3, 2, 1)
+CONTENT_ROWS = range((H - ICON) // 2, H - (H - ICON) // 2)   # what the icons span
+
+
+def arc_mask():
+    """Black over the corners, ON TOP of the content, so the pill clips it.
+
+    Without this an icon or a digit entering at the panel's edge is drawn across
+    the rounded end and reads as sitting outside the pill. The masked region is
+    exactly the region the pill already leaves dark, so it can never eat into
+    the border; only the rows the content can actually reach are masked, because
+    the border row and its one row of clearance never hold a glyph.
+    """
+    els = []
+    for y, inset in enumerate(ARC_INSET):
+        for row in (y, H - 1 - y):
+            if not inset or row not in CONTENT_ROWS:
+                continue
+            for x in (0, W - inset):
+                els.append({"id": f"mask{x}x{row}", "type": "rectangle",
+                            "x": x, "y": row, "width": inset, "height": 1,
+                            "radius": 0, "fill": "solid",
+                            "fill_colors": ["#000000FF"], "border_width": 0,
+                            "align": "top_left", "z_index": 7,
+                            "timeout": ELEMENT_TIMEOUT})
+    return els
+
+
 def pill_parts(colors):
     """The static background every path shares: the pill, its hairlines and its
     softened corners. One definition, so the three render paths cannot end up
@@ -1063,6 +1106,7 @@ def strip_frame(segs, marks, total, offset):
     px = -offset                      # banner coordinate at the screen's left edge
     colors = window_colors(marks, total, px)
     els = pill_parts(colors)
+    els += arc_mask()
     for i, seg in enumerate(segs):
         els.append({"id": f"i{i}", "type": "image", "path": f"{seg['key']}.png",
                     "x": seg["icon_x"] + offset, "y": (H - ICON) // 2,
@@ -1634,7 +1678,7 @@ def self_check():
     counts = counts_from(stats)
     assert counts[0][1] == 53698, "total should be the sum of the three tiles"
     segs, width = layout(counts)
-    assert [s["text"] for s in segs] == ["53,698", "28,588", "20,936", "4,174"]
+    assert [s["text"] for s in segs] == ["53 698", "28 588", "20 936", "4 174"]
 
     # nothing may overlap: every element's span ends before the next one starts
     spans = []
@@ -1709,11 +1753,12 @@ def self_check():
     # the firmware-scrolled strip: every service named, and the colour able to
     # say which one is under the window
     text, marks, total = strip(counts_from(social))
-    assert text.startswith("TOTAL 53,698"), text[:20]
-    assert "SOUNDCLOUD 28,588" in text and "FANS 1,726" in text, text
+    assert text.startswith("TOTAL 53 698"), text[:20]
+    assert "SOUNDCLOUD 28 588" in text and "FANS 1 726" in text, text
+    assert "," not in text, "a comma is the one glyph here with a descender"
     assert [k for _, k in marks] == ["globe", "soundcloud", "spotify",
                                      "apple_music", "fans"], marks
-    assert total == sum(text_width(f"{LABELS[k]} {v:,}") + text_width(SEPARATOR)
+    assert total == sum(text_width(f"{LABELS[k]} {group(v)}") + text_width(SEPARATOR)
                         for k, v in counts_from(social)), total
     # Every service must reach its OWN brand colour somewhere in its tile. The
     # previous version of this check skipped any tile with no room for a pure
@@ -1865,7 +1910,19 @@ def self_check():
     # half across a 435-frame pass. Cheap enough to soften four corners, not
     # cheap enough to stop counting.
     assert len(a) <= 40, f"{len(a)} elements per recorded frame is getting dear"
-    assert len(a) == len(pill_parts(["#000000FF", "#000000FF"])) + 2 * len(segs2)
+    assert len(a) == (len(pill_parts(["#000000FF", "#000000FF"]))
+                      + len(arc_mask()) + 2 * len(segs2))
+    # the mask must sit above the content it clips, and only ever cover pixels
+    # the pill already leaves dark, so it can never bite into the border
+    mask = [e for e in a if e["id"].startswith("mask")]
+    assert mask and all(e["z_index"] > 6 for e in mask)
+    for e in mask:
+        assert e["fill_colors"] == ["#000000FF"] and e["height"] == 1
+        row = e["y"] if e["y"] < H // 2 else H - 1 - e["y"]
+        assert e["width"] == ARC_INSET[row], e
+        assert e["x"] in (0, W - e["width"]), e
+    assert all(e["y"] in CONTENT_ROWS for e in mask), \
+        "masking a border row would be wasted; nothing draws there"
 
     # the cadence latch: it must calibrate once and stay calibrated, however
     # often the profile counter is reset underneath it
