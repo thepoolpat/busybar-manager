@@ -6,6 +6,8 @@
     python3 app.py --render host          # this process pushes every frame
     python3 app.py --source songstats     # live daily numbers, needs SONGSTATS_API_KEY
     python3 app.py --speed 6              # slower crawl, pixels per second
+    python3 app.py --fps 60 --speed 30    # panel-synced: 2 refreshes per pixel
+    python3 app.py --render device --pause 0   # firmware scroll, no loop pause
     python3 app.py --sc 28588 --sp 20936 --am 4174   # pin the numbers, skip fetching
     python3 app.py --sc 1182 --sp 13058 --fans 1726  # rehearse the songstats banner
     python3 app.py --shot banner.png      # save what the bar is showing, 8x
@@ -807,6 +809,32 @@ SEPARATOR = "   "                        # blank run between one service and the
 SCROLL_PPM = 1800
 SCROLL_START_MS = 600
 SCROLL_REPEAT_MS = 1500
+# The panel's own refresh, and the number every smooth scroll has to agree with.
+# Nothing on this bar moves by less than a whole pixel, so "smooth" can only
+# mean EVEN: the same number of panel frames between every pixel step. A speed
+# the refresh does not divide cannot do that -- 16 px/s is 3.75 frames a step,
+# which the firmware serves as 4,4,4,3,4,4,4,3 and the eye reads as a limp.
+PANEL_HZ = 60
+
+
+def panel_speed(speed):
+    """(speed, panel frames per pixel) snapped so the hold is a whole number.
+
+    60, 30, 20, 15, 12, 10, 6, 5 px/s survive untouched; everything between is
+    pulled to its nearest neighbour rather than left to beat against the panel.
+    """
+    hold = max(1, round(PANEL_HZ / max(1, speed)))
+    return PANEL_HZ / hold, hold
+
+
+def speed_limp_ratio(speed):
+    """Panel frames per pixel a --speed would need, taken literally, for
+    explaining why panel_speed() had to snap it. None when the ask isn't a
+    ratio at all -- a zero or negative --speed, which panel_speed() already
+    clamps to something usable but PANEL_HZ / speed can't safely divide by."""
+    return PANEL_HZ / speed if speed > 0 else None
+
+
 TEXT_X, TEXT_W = 4, 64                   # the label window, inset inside the pill
 
 # The pill is INSET one pixel from the display on every side, so the whole of
@@ -1073,12 +1101,12 @@ def pill_parts(colors):
     ]
 
 
-def device_frame(text, colors):
+def device_frame(text, colors, ppm=SCROLL_PPM, pause_ms=SCROLL_REPEAT_MS):
     return pill_parts(colors) + [
         {"id": "txt", "type": "text", "text": text, "font": FONT, "color": NUMBER,
          "x": TEXT_X, "y": H // 2, "align": "mid_left", "width": TEXT_W,
-         "scroll_rate": SCROLL_PPM, "scroll_start_delay": SCROLL_START_MS,
-         "scroll_repeat_delay": SCROLL_REPEAT_MS,
+         "scroll_rate": ppm, "scroll_start_delay": SCROLL_START_MS,
+         "scroll_repeat_delay": pause_ms,
          "z_index": 5, "timeout": ELEMENT_TIMEOUT},
     ]
 
@@ -1254,7 +1282,7 @@ def build_anim(args, stats):
     """--build-anim: record the banner and leave a file per --fps on disk."""
     frames = capture_frames(args, stats)
     for fps in args.fps:
-        blob = pack_pass(frames, fps, args.speed)
+        blob = pack_pass(frames, fps, args.speed, args.subpixel)
         path = anim_path(args.build_anim, fps, len(args.fps) > 1)
         with open(path, "wb") as fh:
             fh.write(blob)
@@ -1270,7 +1298,37 @@ def anim_path(base, fps, tag):
     return f"{stem}-{fps}fps{ext}"          # directory cannot eat the name
 
 
-def pack_pass(frames, fps, speed):
+def interpolate(frames, sub):
+    """Whole-pixel captures -> `sub` positions per pixel, by blending.
+
+    The panel has no sub-pixel and never will, but a column lit to 40% of the
+    way from its old colour to its new one is what 40% of a pixel of travel
+    LOOKS like -- the same trick an LED sign uses to crawl smoothly at a speed
+    far below one pixel per refresh. Without it "smooth" and "readable" are
+    opposites here: one image per pixel means a 30 px/s scroll can only ever
+    be 30 moves a second however high the header rate goes.
+
+    The last frame blends into the first, because the pass is a loop.
+
+    ponytail: linear on the raw panel bytes, not in linear light. The blend is
+    a position, not a colour mix, and the eye integrates it over motion; a
+    gamma-correct version would cost a 256-entry table each way to fix
+    something nobody can see at 16 rows. Revisit if the crawl ever looks like
+    it lurches between whole pixels.
+    """
+    if sub < 2:
+        return frames
+    out = []
+    for i, a in enumerate(frames):
+        b = frames[(i + 1) % len(frames)]
+        out.append(a)
+        for k in range(1, sub):
+            t = k / sub
+            out.append(bytes(p + int((q - p) * t) for p, q in zip(a, b)))
+    return out
+
+
+def pack_pass(frames, fps, speed, subpixel=False):
     """One recording -> one .anim at one frame rate.
 
     ponytail: the frames are rate-INDEPENDENT. Every pixel of the gradient is a
@@ -1298,10 +1356,24 @@ def pack_pass(frames, fps, speed):
     # The corollary is the ceiling: one pixel per display frame is as fast as a
     # pass can go, so 25 fps cannot express a 30 px/s scroll at all -- hold 1 is
     # 25 px/s and there is nothing between. That is reported, not rounded away.
-    duration = max(1, round(fps / max(1, speed)))
+    # The header rate is also what the pass is CLOCKED at, and that is the part
+    # that decides whether it looks smooth. The player ticks at fps, the panel
+    # at PANEL_HZ, and unless one divides the other a pixel step lands between
+    # panel frames -- held 5 frames, then 6, then 5, which is the judder the
+    # hold count below is there to expose. fps 60, 30, 20, 15, 12, 10 are clean;
+    # 32 and 16 are not, whatever --speed they are packed at.
+    sub = max(1, round(fps / max(1, speed))) if subpixel else 1
+    if sub > 1:
+        frames = interpolate(frames, sub)
+    duration = max(1, round(fps / max(1, speed * sub)))
     blob = anim_pack(frames, fps, duration)
-    achieved = fps / duration                  # px/s the hold actually produces
+    achieved = fps / duration / sub            # px/s the hold actually produces
     drift = achieved / speed - 1
+    panel_hold = PANEL_HZ * duration / fps     # panel frames each IMAGE is held
+    print(f"  {fps} fps: {panel_hold:.2f} panel frames per image, "
+          f"{sub} image{'s' if sub > 1 else ''} per pixel"
+          + ("" if abs(panel_hold - round(panel_hold)) < 0.005
+             else f" -- uneven, the step will limp; --fps {PANEL_HZ} is clean"))
     raw_total = len(frames) * W * H * 3
     print(f"  {fps} fps, hold {duration}: {achieved:.2f} px/s "
           f"({'exact' if abs(drift) < 0.005 else f'{drift:+.1%} off --speed {speed}'}), "
@@ -1312,7 +1384,8 @@ def pack_pass(frames, fps, speed):
 
 def record_anim(args, stats):
     """Record and pack at the first --fps: what the live paths play."""
-    return pack_pass(capture_frames(args, stats), args.fps[0], args.speed)
+    return pack_pass(capture_frames(args, stats), args.fps[0], args.speed,
+                     args.subpixel)
 
 
 def capture_frames(args, stats):
@@ -1365,37 +1438,97 @@ def anim_asset(fps, tag):
     return anim_path(ANIM_ASSET, fps, tag)
 
 
+# How often run_anim and run_device read the framebuffer back just to see
+# whether the bar is still there. A power cycle -- an actual reboot, not a
+# BUSY session -- forgets whatever was drawn or uploaded, and by design
+# neither loop otherwise touches the bar again between stats changes, which
+# for the portfolio source is once a week. So without a probe, "the bar
+# rebooted" and "the banner is gone until Sunday" are the same bug. One
+# /api/screen read is the cheapest call that only succeeds while the bar
+# still remembers who it is.
+HEALTH_PERIOD = 60
+
+
+def bar_probe_result(was_healthy, ok):
+    """(new `healthy`, whether this probe just caught a recovery) from one
+    liveness check. Shared by run_anim and run_device so both notice the
+    exact same thing: the bar going quiet, and distinctly, coming back --
+    that second edge is the one that means "it forgot what we drew"."""
+    return ok, ok and not was_healthy
+
+
 def run_anim(args, stats):
     """Record the banner, upload it, and hand the screen to the firmware.
 
-    Steady state costs nothing: after the upload this process sends no frames
-    and no recolours, it only wakes to see whether the numbers moved. They move
-    once a week, and a rebuild is about half a minute, so paying that to get the
-    logos back at panel rate is the right way round.
+    Steady state costs almost nothing: after the upload this process sends no
+    frames and no recolours, it only wakes to see whether the numbers moved
+    and, every HEALTH_PERIOD, whether the bar is still the one it uploaded to.
+    They move once a week, and a rebuild is about half a minute, so paying
+    that to get the logos back at panel rate is the right way round.
     """
-    shown = None
+    shown, healthy = None, True
+    next_fetch = time.monotonic() + args.refresh
     try:
         while True:
             if counts_from(stats) != shown:
-                # One trip to the device, then a pass per --fps off the same
-                # frames. The first rate is the one that plays; the rest sit on
-                # the bar so switching between them is a draw, not a re-record.
-                frames = capture_frames(args, stats)
-                tag = len(args.fps) > 1
-                for fps in args.fps:
-                    upload(args.host, anim_asset(fps, tag),
-                           pack_pass(frames, fps, args.speed))
-                playing = anim_asset(args.fps[0], tag)
-                draw(args.host, [{"id": "anim", "type": "animation",
-                                  "path": playing, "loop": True,
-                                  "x": 0, "y": 0, "align": "top_left",
-                                  "z_index": 0, "timeout": 0}])
-                shown = counts_from(stats)
-                spare = [anim_asset(f, tag) for f in args.fps[1:]]
-                print(f"playing {playing} - this process is now idle"
-                      + (f"; also on the bar: {', '.join(spare)}" if spare else ""))
+                want = counts_from(stats)
+                try:
+                    # One trip to the device, then a pass per --fps off the
+                    # same frames. The first rate is the one that plays; the
+                    # rest sit on the bar so switching between them is a
+                    # draw, not a re-record.
+                    frames = capture_frames(args, stats)
+                    tag = len(args.fps) > 1
+                    for fps in args.fps:
+                        upload(args.host, anim_asset(fps, tag),
+                               pack_pass(frames, fps, args.speed, args.subpixel))
+                    playing = anim_asset(args.fps[0], tag)
+                    draw(args.host, [{"id": "anim", "type": "animation",
+                                      "path": playing, "loop": True,
+                                      "x": 0, "y": 0, "align": "top_left",
+                                      "z_index": 0, "timeout": 0}])
+                except Exception as e:                      # noqa: BLE001
+                    # A probe succeeding is not a promise the link survives
+                    # the ~30s multi-request build that follows. If it drops
+                    # mid-build, say so and let the health loop below rate
+                    # limit the retry, rather than taking the whole process
+                    # down with it -- any exit here reads to the manager as
+                    # a crash and restarts on backoff.
+                    print(f"rebuild failed, will try again ({e})")
+                    healthy = False
+                else:
+                    shown = want
+                    spare = [anim_asset(f, tag) for f in args.fps[1:]]
+                    print(f"playing {playing} - this process is now idle"
+                          + (f"; also on the bar: {', '.join(spare)}" if spare else ""))
 
-            time.sleep(args.refresh)
+            # Probe in HEALTH_PERIOD beats until either the bar comes back
+            # from an outage (forcing an immediate rebuild) or the fetch
+            # deadline arrives, whichever is first -- an ABSOLUTE deadline,
+            # not a budget that restarts every time we loop back here, so a
+            # bar that keeps flapping (recovering roughly once a cycle) can't
+            # starve the stats refresh forever the way a per-cycle budget did.
+            recovered = False
+            while True:
+                remaining = next_fetch - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(HEALTH_PERIOD, remaining))
+                try:
+                    grab(args.host)
+                    healthy, recovered = bar_probe_result(healthy, True)
+                except Exception:                         # noqa: BLE001
+                    if healthy:
+                        print("lost the bar - will rebuild once it's back")
+                    healthy, recovered = bar_probe_result(healthy, False)
+                if recovered:
+                    print("bar is back - it forgot the last upload, rebuilding")
+                    shown = None                # forces the rebuild above
+                    break
+            if recovered:
+                continue
+
+            next_fetch = time.monotonic() + args.refresh
             if stats["as_of"] == "pinned":
                 continue
             try:
@@ -1416,8 +1549,32 @@ def run_anim(args, stats):
 def run_device(args, stats):
     """Scroll on the firmware, recolour from the host. No frame loop."""
     text, marks, total = strip(counts_from(stats))
-    print(f"{len(text)} chars / {total}px on the firmware at "
-          f"{SCROLL_PPM / 60:.0f} px/s - the panel renders it, not this process")
+    # --speed used to be ignored here entirely: the element always carried the
+    # 1800 ppm constant, so every device preset scrolled at 30 px/s whatever it
+    # asked for. It is honoured now, snapped to a whole number of panel frames
+    # per pixel so the firmware's own step cadence stays even.
+    speed, hold = panel_speed(args.speed)
+    ppm = round(speed * 60)
+    if abs(speed - args.speed) > 0.01:
+        ratio = speed_limp_ratio(args.speed)
+        if ratio is not None:
+            print(f"--speed {args.speed} is {ratio:.2f} panel frames per pixel, "
+                  f"which limps; scrolling at {speed:g} px/s instead")
+        else:
+            print(f"--speed {args.speed} is not a scroll speed; "
+                  f"scrolling at {speed:g} px/s instead")
+    print(f"{len(text)} chars / {total}px on the firmware at {speed:g} px/s "
+          f"(one pixel every {hold} panel frame{'s' if hold > 1 else ''}) "
+          f"- the panel renders it, not this process")
+    if args.pause:
+        print(f"pausing {args.pause}ms at the end of each pass; --pause 0 for "
+              f"an unbroken crawl")
+    if args.layout == "banner":
+        # Said out loud rather than silently ignored: the firmware scrolls a
+        # TEXT element, and there is no image element it will move. Per-service
+        # logo pills exist only on the paths that draw or record every frame.
+        print("--layout banner has no meaning on --render device: the firmware "
+              "scrolls text, not logos. Showing the labelled strip.")
 
     started = time.monotonic()
     if not 0.0 <= args.dim <= args.bright <= 1.0:
@@ -1426,9 +1583,10 @@ def run_device(args, stats):
           f"wave travels only on --render anim, where a frame is recorded "
           f"rather than drawn over the firmware's scroll")
     colors = window_colors(marks, total, 0.0, args.dim, args.bright)
-    draw(args.host, device_frame(text, colors))
+    draw(args.host, device_frame(text, colors, ppm, args.pause))
     next_fetch = started + args.refresh
-    blocked = False
+    next_probe = started + HEALTH_PERIOD
+    blocked, healthy = False, True
     ticks, reported, beat, due = 0, started, 1.0 / RECOLOUR_HZ, started
     sent, sent_skipped = 1, 0            # the first draw above already went
     calibrating, calibrated, calib_from = 0, False, started
@@ -1449,15 +1607,41 @@ def run_device(args, stats):
             # So on this path you get scrolling words on a still gradient, which
             # is what it now does. --render anim is the path that gets both, by
             # recording the frames instead of racing the firmware for the wire.
-            if not blocked and sent:
+            #
+            # One thing this skip cannot tell apart from "still fine": the bar
+            # rebooting. A power cycle drops our element same as a BUSY session
+            # does, but returns 200 to the next unrelated request rather than a
+            # 409 -- there is no failure here to notice, because we stop asking.
+            #
+            # A first attempt forced a real draw on a fixed clock regardless of
+            # health, which fixed that -- and cost a scroll-restarting redraw
+            # every few minutes even when the bar had never left. What actually
+            # needs to be periodic is the READ, not the draw: grab() doesn't
+            # touch the scroll, so it can run on a clock for free, and only the
+            # rising edge it might catch -- unhealthy, now healthy again -- is
+            # worth a real draw over.
+            force_draw = False
+            if now >= next_probe:
+                next_probe = now + HEALTH_PERIOD
+                try:
+                    grab(args.host)
+                    healthy, force_draw = bar_probe_result(healthy, True)
+                except Exception:                          # noqa: BLE001
+                    if healthy:
+                        print("lost the bar - will redraw once it's back")
+                    healthy, force_draw = bar_probe_result(healthy, False)
+                if force_draw:
+                    print("bar is back - it forgot the element, redrawing")
+
+            if not blocked and sent and not force_draw:
                 sent_skipped += 1
                 status, body = 200, ""
             else:
                 try:
-                    # a full redraw, because recovering from a 409 means the
-                    # text element went with the screen
+                    # a full redraw, because recovering from a 409 (or a
+                    # reboot) means the text element went with the screen
                     status, body = draw(args.host,
-                                        device_frame(text, colors))
+                                        device_frame(text, colors, ppm, args.pause))
                 except urllib.error.URLError as e:
                     print(f"skipped a redraw ({e.reason})")
                     status, body = 200, ""
@@ -1486,7 +1670,7 @@ def run_device(args, stats):
                         text, marks, total = strip(counts_from(stats))
                         started = due = time.monotonic()   # the strip changed length
                         colors = window_colors(marks, total, 0.0, args.dim, args.bright)
-                        draw(args.host, device_frame(text, colors))
+                        draw(args.host, device_frame(text, colors, ppm, args.pause))
                         print(f"updated: {total}px")
             ticks += 1
             if not calibrated:
@@ -1508,7 +1692,7 @@ def run_device(args, stats):
                 span = now - reported
                 print(f"{ticks / span:.1f} Hz tick, {sent / span:.1f} Hz sent, "
                       f"{sent_skipped / span:.1f} Hz deduped, "
-                      f"text {SCROLL_PPM / 60:.0f} px/s on the firmware")
+                      f"text {speed:g} px/s on the firmware")
                 ticks, reported, sent, sent_skipped = 0, now, 0, 0
             due += beat
             time.sleep(max(0.0, due - time.monotonic()))
@@ -1819,6 +2003,43 @@ def self_check():
     assert (SCROLL_PPM / 60.0) / RECOLOUR_HZ <= 1.0, "colour must not lag the scroll"
     assert RECOLOUR_HZ == 2 * (SCROLL_PPM / 60.0), "60 Hz gradient, 30 px/s text"
 
+    # the scroll cadence: a pixel step must always be a whole number of panel
+    # frames, or the firmware serves 4,4,4,3 and the eye reads a limp
+    for wanted in (5, 6, 10, 12, 15, 20, 30, 60):
+        assert panel_speed(wanted) == (wanted, PANEL_HZ // wanted), wanted
+    assert panel_speed(16) == (15.0, 4), panel_speed(16)   # the banner preset's ask
+    assert panel_speed(11) == (12.0, 5), panel_speed(11)
+    assert panel_speed(0)[1] == PANEL_HZ, "a zero speed must not divide by zero"
+    assert panel_speed(999) == (float(PANEL_HZ), 1), "one pixel a frame is the ceiling"
+    # and the default must already be clean, or every preset inherits the limp
+    assert panel_speed(parse_args([]).speed)[0] == parse_args([]).speed
+    assert parse_args([]).pause == SCROLL_REPEAT_MS
+    assert parse_args(["--pause", "0"]).pause == 0, "an unbroken crawl must be askable"
+
+    # the ratio that explains a limp is undefined, not a crash, once --speed
+    # is zero or negative -- run_device's print used to divide by it directly
+    assert speed_limp_ratio(12) == 5.0
+    assert speed_limp_ratio(0) is None, "--speed 0 must not raise ZeroDivisionError"
+    assert speed_limp_ratio(-3) is None
+
+    # the reboot-recovery probe run_anim and run_device both poll on: a rising
+    # edge (unhealthy -> healthy) is a recovery, every other transition isn't
+    assert bar_probe_result(True, True) == (True, False)
+    assert bar_probe_result(True, False) == (False, False)
+    assert bar_probe_result(False, True) == (True, True)
+    assert bar_probe_result(False, False) == (False, False)
+
+    # sub-pixel: the blend fills the gaps between whole-pixel captures, keeps
+    # the captures themselves untouched, and closes the loop at the wrap
+    a, b = bytes([0, 0, 0]), bytes([100, 200, 40])
+    assert interpolate([a, b], 1) == [a, b], "off by default, byte for byte"
+    four = interpolate([a, b], 2)
+    assert len(four) == 4 and four[0] == a and four[2] == b, four
+    assert four[1] == bytes([50, 100, 20]), four[1]      # halfway between them
+    assert four[3] == bytes([50, 100, 20]), "the last frame blends into the first"
+    assert all(len(f) == len(a) for f in interpolate([a, b], 5))
+    assert len(interpolate([a, b, a], 3)) == 9
+
     # the border shares the fill's hue -- coherent, not contrasting -- and is
     # always far enough away in brightness to still read as an edge
     for c in ("#FF5500FF", "#1ED760FF", "#5B4FE9FF", "#FA243CFF",
@@ -2100,6 +2321,16 @@ def parse_args(argv=None):
                    help=f"scroll speed in pixels per second, the same rate the "
                         f"firmware scrolls at in --render device so the paths "
                         f"match (default: {SCROLL_PPM // 60})")
+    p.add_argument("--subpixel", action="store_true",
+                   help="on --render anim, blend the captured frames into "
+                        "sub-pixel positions so the crawl runs at the panel's "
+                        "own rate instead of --speed steps a second. Costs one "
+                        "extra frame per sub-step in the file, no extra time "
+                        "on the device")
+    p.add_argument("--pause", type=int, default=SCROLL_REPEAT_MS,
+                   help=f"milliseconds the firmware holds still at the end of "
+                        f"each pass on --render device; 0 for an unbroken crawl "
+                        f"(default: {SCROLL_REPEAT_MS})")
     p.add_argument("--shot", metavar="PNG", help="save the current display and exit")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--test", action="store_true", help="self-check, no device needed")
